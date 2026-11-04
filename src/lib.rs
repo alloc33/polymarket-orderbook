@@ -1,3 +1,4 @@
+pub mod polymarket;
 pub mod util;
 
 mod side;
