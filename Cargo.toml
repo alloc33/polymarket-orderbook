@@ -1,0 +1,19 @@
+[package]
+name = "kalshi-orderbook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+build = "src/util/build.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[build-dependencies]
+ergo-sbe = "=0.1.16"
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.9"
