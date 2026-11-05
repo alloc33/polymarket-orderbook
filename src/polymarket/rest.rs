@@ -29,7 +29,7 @@ struct Market {
 }
 
 impl Market {
-    fn tokens(&self) -> anyhow::Result<Vec<String>> {
+    fn assets(&self) -> anyhow::Result<Vec<String>> {
         if !(self.accepting_orders && self.enable_order_book) {
             return Ok(Vec::new());
         }
@@ -40,20 +40,20 @@ impl Market {
     }
 }
 
-pub async fn live_tokens(client: &reqwest::Client) -> anyhow::Result<BTreeSet<String>> {
-    let mut tokens = BTreeSet::new();
+pub async fn live_assets(client: &reqwest::Client) -> anyhow::Result<BTreeSet<String>> {
+    let mut assets = BTreeSet::new();
     let mut cursor = None;
 
     loop {
         let page = fetch_page(client, cursor.as_deref()).await?;
 
         for market in page.events.iter().flat_map(|event| &event.markets) {
-            tokens.extend(market.tokens()?);
+            assets.extend(market.assets()?);
         }
 
         match page.next_cursor {
             Some(next) => cursor = Some(next),
-            None => return Ok(tokens),
+            None => return Ok(assets),
         }
     }
 }
@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_yields_tokens_of_tradable_markets_only() {
+    fn page_yields_assets_of_tradable_markets_only() {
         let json = r#"{
             "events": [
                 {
@@ -119,16 +119,16 @@ mod tests {
         }"#;
 
         let page: EventsPage = serde_json::from_str(json).unwrap();
-        let tokens: Vec<String> = page
+        let assets: Vec<String> = page
             .events
             .iter()
             .flat_map(|event| &event.markets)
-            .map(Market::tokens)
+            .map(Market::assets)
             .collect::<anyhow::Result<Vec<_>>>()
             .unwrap()
             .concat();
 
-        assert_eq!(tokens, ["32338220190071351435", "25659310674993675562"]);
+        assert_eq!(assets, ["32338220190071351435", "25659310674993675562"]);
         assert_eq!(
             page.next_cursor.as_deref(),
             Some("ydSsD4qHilYotO3MIYTL75t4")
@@ -144,13 +144,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_token_list_is_an_error() {
+    fn malformed_asset_list_is_an_error() {
         let market = Market {
             accepting_orders: true,
             enable_order_book: true,
             clob_token_ids: Some("not json".to_owned()),
         };
 
-        assert!(market.tokens().is_err());
+        assert!(market.assets().is_err());
     }
 }

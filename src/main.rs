@@ -1,18 +1,34 @@
 use std::time::Duration;
 
-use polymarket_orderbook::polymarket::rest;
+use clap::Parser;
+use polymarket_orderbook::{connection, polymarket::rest};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+struct Config {
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
+        .init();
+    let config = Config::parse();
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let tokens = rest::live_tokens(&client).await?;
+    let assets = rest::live_assets(&client).await?;
+    info!(
+        total = assets.len(),
+        limit = config.limit,
+        "listed live assets"
+    );
 
-    println!("{} live tokens", tokens.len());
-    for token in tokens.iter().take(10) {
-        println!("{token}");
-    }
-
-    Ok(())
+    let assets: Vec<String> = assets.into_iter().take(config.limit).collect();
+    connection::run(assets).await
 }

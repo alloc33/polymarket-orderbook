@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod polymarket;
 pub mod util;
 
