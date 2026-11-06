@@ -1,5 +1,6 @@
 pub mod balancer;
 pub mod book;
+pub mod collector;
 pub mod connection;
 pub mod engine;
 pub mod polymarket;

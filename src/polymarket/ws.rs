@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -18,6 +18,19 @@ pub async fn connect() -> anyhow::Result<Socket> {
 
 pub fn subscribe(assets_ids: &[String]) -> Message {
     Message::text(serde_json::json!({ "assets_ids": assets_ids, "type": "market" }).to_string())
+}
+
+pub fn update(operation: Operation, asset_id: &str) -> Message {
+    Message::text(
+        serde_json::json!({ "operation": operation, "assets_ids": [asset_id] }).to_string(),
+    )
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Operation {
+    Subscribe,
+    Unsubscribe,
 }
 
 pub fn parse(frame: &str) -> serde_json::Result<Vec<Event>> {
@@ -86,6 +99,17 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({ "assets_ids": ["123", "456"], "type": "market" })
+        );
+    }
+
+    #[test]
+    fn update_message_has_documented_shape() {
+        let message = update(Operation::Unsubscribe, "123").into_text().unwrap();
+        let json: serde_json::Value = serde_json::from_str(message.as_str()).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({ "operation": "unsubscribe", "assets_ids": ["123"] })
         );
     }
 

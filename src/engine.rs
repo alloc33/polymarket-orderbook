@@ -24,9 +24,12 @@ use crate::{
 
 pub const CHUNK_SIZE: usize = 64 << 20;
 
-pub struct Inbound {
-    pub received_at: DateTime<Utc>,
-    pub event: Event,
+pub enum Inbound {
+    Event {
+        received_at: DateTime<Utc>,
+        event: Event,
+    },
+    Forget(String),
 }
 
 pub struct Engine {
@@ -67,7 +70,14 @@ impl Engine {
     }
 
     fn handle(&mut self, inbound: Inbound) -> anyhow::Result<()> {
-        match inbound.event {
+        let (received_at, event) = match inbound {
+            Inbound::Event { received_at, event } => (received_at, event),
+            Inbound::Forget(asset) => {
+                self.books.remove(&asset);
+                return Ok(());
+            }
+        };
+        match event {
             Event::Book(book) => {
                 let order_book = match OrderBook::try_from(&book) {
                     Ok(order_book) => order_book,
@@ -76,11 +86,8 @@ impl Engine {
                         return Ok(());
                     }
                 };
-                self.writer.write_msg(&snapshot(
-                    &book.asset_id,
-                    &order_book,
-                    inbound.received_at,
-                ))?;
+                self.writer
+                    .write_msg(&snapshot(&book.asset_id, &order_book, received_at))?;
                 self.books.insert(book.asset_id, order_book);
             }
             Event::PriceChange(change) => {
@@ -99,7 +106,7 @@ impl Engine {
                             self.writer.write_msg(&snapshot(
                                 &level.asset_id,
                                 order_book,
-                                inbound.received_at,
+                                received_at,
                             ))?;
                             order_book
                         }
@@ -114,7 +121,7 @@ impl Engine {
                     self.writer.write_msg(&level_update(
                         &level.asset_id,
                         update,
-                        inbound.received_at,
+                        received_at,
                         exchange_ts,
                     ))?;
                 }
@@ -199,7 +206,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let received_at = DateTime::from_timestamp_millis(1_793_811_735_800).unwrap();
 
-        tx.send(Inbound {
+        tx.send(Inbound::Event {
             received_at,
             event: Event::Book(Book {
                 asset_id: "1".to_owned(),
@@ -209,7 +216,7 @@ mod tests {
             }),
         })
         .unwrap();
-        tx.send(Inbound {
+        tx.send(Inbound::Event {
             received_at,
             event: Event::PriceChange(PriceChange {
                 timestamp: "1793811751973".to_owned(),
@@ -267,7 +274,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let received_at = DateTime::from_timestamp_millis(1_793_811_751_990).unwrap();
 
-        tx.send(Inbound {
+        tx.send(Inbound::Event {
             received_at,
             event: Event::PriceChange(PriceChange {
                 timestamp: "1793811751973".to_owned(),
