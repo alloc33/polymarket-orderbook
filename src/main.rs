@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use polymarket_orderbook::{connection, polymarket::rest};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -30,5 +31,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let assets: Vec<String> = assets.into_iter().take(config.limit).collect();
-    connection::run(assets).await
+    let shutdown = CancellationToken::new();
+    let mut connection = tokio::spawn(connection::run(assets, shutdown.clone()));
+
+    tokio::select! {
+        result = &mut connection => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            info!("shutting down");
+            shutdown.cancel();
+            connection.await?
+        }
+    }
 }

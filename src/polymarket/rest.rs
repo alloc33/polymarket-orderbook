@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
+use tracing::warn;
 
 const EVENTS_URL: &str = "https://gamma-api.polymarket.com/events/keyset";
 const PAGE_LIMIT: &str = "100";
@@ -75,7 +76,10 @@ async fn fetch_page(client: &reqwest::Client, cursor: Option<&str>) -> anyhow::R
 
         match result {
             Ok(page) => return Ok(page),
-            Err(_) if attempt < ATTEMPTS => attempt += 1,
+            Err(error) if attempt < ATTEMPTS => {
+                warn!(%error, attempt, "retrying events page");
+                attempt += 1;
+            }
             Err(error) => return Err(error.into()),
         }
     }
