@@ -1,13 +1,23 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use polymarket_orderbook::{connection, polymarket::rest};
+use polymarket_orderbook::{
+    connection,
+    engine::{self, Engine},
+    polymarket::rest,
+    util::AlignedSbeWriter,
+};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 struct Config {
+    #[arg(long, default_value = "/dev/stdout")]
+    output: PathBuf,
+    #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+    snapshot_interval: u64,
     #[arg(long, default_value_t = 100)]
     limit: usize,
 }
@@ -29,12 +39,16 @@ async fn main() -> anyhow::Result<()> {
         limit = config.limit,
         "listed live assets"
     );
-
     let assets: Vec<String> = assets.into_iter().take(config.limit).collect();
-    let shutdown = CancellationToken::new();
-    let mut connection = tokio::spawn(connection::run(assets, shutdown.clone()));
 
-    tokio::select! {
+    let writer = AlignedSbeWriter::create(&config.output, engine::CHUNK_SIZE)?;
+    let engine = Engine::new(writer, Duration::from_secs(config.snapshot_interval));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let engine = tokio::spawn(engine.run(rx));
+
+    let shutdown = CancellationToken::new();
+    let mut connection = tokio::spawn(connection::run(assets, tx, shutdown.clone()));
+    let outcome = tokio::select! {
         result = &mut connection => result?,
         signal = tokio::signal::ctrl_c() => {
             signal?;
@@ -42,5 +56,8 @@ async fn main() -> anyhow::Result<()> {
             shutdown.cancel();
             connection.await?
         }
-    }
+    };
+
+    engine.await??;
+    outcome
 }
