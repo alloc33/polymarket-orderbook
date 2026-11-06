@@ -3,6 +3,7 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -36,12 +37,18 @@ pub enum Operation {
     Unsubscribe,
 }
 
-// The initial books of a subscription arrive as one array frame.
-pub fn parse(frame: &str) -> serde_json::Result<Vec<Event>> {
-    if frame.starts_with('[') {
-        serde_json::from_str(frame)
-    } else {
-        serde_json::from_str(frame).map(|event| vec![event])
+// The initial books of a subscription arrive as one array frame. Its elements are
+// decoded one by one so that a single bad element does not cost the other books.
+pub fn parse(frame: &str) -> Vec<serde_json::Result<Event>> {
+    if !frame.starts_with('[') {
+        return vec![serde_json::from_str(frame)];
+    }
+    match serde_json::from_str::<Vec<&RawValue>>(frame) {
+        Ok(elements) => elements
+            .into_iter()
+            .map(|element| serde_json::from_str(element.get()))
+            .collect(),
+        Err(error) => vec![Err(error)],
     }
 }
 
@@ -93,91 +100,109 @@ pub enum OrderSide {
 mod tests {
     use super::*;
 
+    const YES: &str =
+        "90227223115596293448966158151606153337847900483048338623540402385929720677904";
+    const NO: &str =
+        "105134691322323565615831879054043168027913414000042547943201361115853277749482";
+
+    fn book_frame(asset_id: &str) -> String {
+        format!(
+            r#"{{"market": "0xe50c71cc5e2372bf0f6194a02e51459dd03b2c7b2d78a0d4650e5f36c425338b",
+                 "asset_id": "{asset_id}", "timestamp": "1793977813000",
+                 "hash": "608a04e09e2a3e8b514160d1f891619cd2cd20e5",
+                 "bids": [{{"price": "0.997", "size": "105486.43"}}, {{"price": "0.998", "size": "287197.36"}}],
+                 "asks": [{{"price": "0.999", "size": "1369896.93"}}],
+                 "tick_size": "0.001", "event_type": "book", "last_trade_price": "0.001"}}"#
+        )
+    }
+
     #[test]
     fn subscribe_message_has_documented_shape() {
-        let assets = BTreeSet::from(["123".to_owned(), "456".to_owned()]);
+        let assets = BTreeSet::from([YES.to_owned(), NO.to_owned()]);
 
         let message = subscribe(&assets).into_text().unwrap();
         let json: serde_json::Value = serde_json::from_str(message.as_str()).unwrap();
 
         assert_eq!(
             json,
-            serde_json::json!({ "assets_ids": ["123", "456"], "type": "market" })
+            serde_json::json!({ "assets_ids": [NO, YES], "type": "market" })
         );
     }
 
     #[test]
     fn update_message_has_documented_shape() {
-        let message = update(Operation::Unsubscribe, "123").into_text().unwrap();
+        let message = update(Operation::Unsubscribe, YES).into_text().unwrap();
         let json: serde_json::Value = serde_json::from_str(message.as_str()).unwrap();
 
         assert_eq!(
             json,
-            serde_json::json!({ "operation": "unsubscribe", "assets_ids": ["123"] })
+            serde_json::json!({ "operation": "unsubscribe", "assets_ids": [YES] })
         );
     }
 
     #[test]
     fn book_event_parses() {
-        let frame = r#"{
-            "event_type": "book",
-            "asset_id": "32338220190071351435",
-            "market": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
-            "timestamp": "1793811735726",
-            "hash": "0xabc123",
-            "bids": [{"price": "0.017", "size": "800"}, {"price": "0.018", "size": "1254.57"}],
-            "asks": [{"price": "0.019", "size": "5884.04"}]
-        }"#;
-
-        let Event::Book(book) = serde_json::from_str(frame).unwrap() else {
+        let Event::Book(book) = serde_json::from_str(&book_frame(YES)).unwrap() else {
             panic!("expected a book event");
         };
 
-        assert_eq!(book.asset_id, "32338220190071351435");
-        assert_eq!(book.timestamp, "1793811735726");
+        assert_eq!(book.asset_id, YES);
+        assert_eq!(book.timestamp, "1793977813000");
         assert_eq!(book.bids.len(), 2);
-        assert_eq!(book.bids[1].price, "0.018");
-        assert_eq!(book.bids[1].size, "1254.57");
+        assert_eq!(book.bids[1].price, "0.998");
+        assert_eq!(book.bids[1].size, "287197.36");
         assert_eq!(book.asks.len(), 1);
     }
 
     #[test]
     fn price_change_event_parses() {
-        let frame = r#"{
-            "event_type": "price_change",
-            "market": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
-            "timestamp": "1793811751973",
-            "price_changes": [
-                {"asset_id": "25659310674993675562", "price": "0.29", "size": "8275", "side": "BUY",
-                 "hash": "57d914ca", "best_bid": "0.981", "best_ask": "0.982"},
-                {"asset_id": "32338220190071351435", "price": "0.71", "size": "0", "side": "SELL",
-                 "hash": "57d914ca", "best_bid": "0.018", "best_ask": "0.019"}
-            ]
-        }"#;
+        let frame = format!(
+            r#"{{"market": "0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6",
+                 "price_changes": [
+                   {{"asset_id": "{YES}", "price": "0.001", "size": "375524.83", "side": "BUY",
+                     "hash": "2634bcad884ee13ca02ab150925aca28178c1f0f", "best_bid": "0.02", "best_ask": "0.023"}},
+                   {{"asset_id": "{NO}", "price": "0.999", "size": "375524.83", "side": "SELL",
+                     "hash": "3245c13d127b56144513277772f7dccd602648b8", "best_bid": "0.977", "best_ask": "0.98"}}
+                 ],
+                 "timestamp": "1793977816442", "event_type": "price_change"}}"#
+        );
 
-        let Event::PriceChange(change) = serde_json::from_str(frame).unwrap() else {
+        let Event::PriceChange(change) = serde_json::from_str(&frame).unwrap() else {
             panic!("expected a price change event");
         };
 
-        assert_eq!(change.timestamp, "1793811751973");
+        assert_eq!(change.timestamp, "1793977816442");
         assert_eq!(change.price_changes.len(), 2);
+        assert_eq!(change.price_changes[0].asset_id, YES);
         assert_eq!(change.price_changes[0].side, OrderSide::Buy);
-        assert_eq!(change.price_changes[0].size, "8275");
+        assert_eq!(change.price_changes[0].size, "375524.83");
         assert_eq!(change.price_changes[1].side, OrderSide::Sell);
-        assert_eq!(change.price_changes[1].size, "0");
+        assert_eq!(change.price_changes[1].price, "0.999");
     }
 
     #[test]
     fn frame_may_hold_one_event_or_a_batch() {
-        let one =
-            r#"{"event_type": "book", "asset_id": "1", "timestamp": "1", "bids": [], "asks": []}"#;
-        let batch = r#"[
-            {"event_type": "book", "asset_id": "1", "timestamp": "1", "bids": [], "asks": []},
-            {"event_type": "book", "asset_id": "2", "timestamp": "1", "bids": [], "asks": []}
-        ]"#;
+        let one = book_frame(YES);
+        let batch = format!("[{}, {}]", book_frame(YES), book_frame(NO));
 
-        assert_eq!(parse(one).unwrap().len(), 1);
-        assert_eq!(parse(batch).unwrap().len(), 2);
+        assert_eq!(parse(&one).len(), 1);
+        assert_eq!(parse(&batch).len(), 2);
+    }
+
+    #[test]
+    fn bad_element_does_not_cost_the_rest_of_the_batch() {
+        let batch = format!(
+            r#"[{}, {{"event_type": "book", "asset_id": 5}}, {}]"#,
+            book_frame(YES),
+            book_frame(NO)
+        );
+
+        let parsed = parse(&batch);
+
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed[0].is_ok());
+        assert!(parsed[1].is_err());
+        assert!(parsed[2].is_ok());
     }
 
     #[test]

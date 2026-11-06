@@ -1,16 +1,12 @@
 //! Custom transpiler from yaml to FIX SBE XML.
 
-use std::{
-    fmt::{self, Write as _},
-    marker::PhantomData,
-    ops::Deref,
-};
+use std::fmt::{self, Write as _};
+use std::marker::PhantomData;
+use std::ops::Deref;
 
 use indexmap::IndexMap;
-use serde::{
-    Deserialize,
-    de::{Deserializer, Error as _, MapAccess, Visitor},
-};
+use serde::Deserialize;
+use serde::de::{Deserializer, Error as _, MapAccess, Visitor};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

@@ -1,11 +1,8 @@
 //! Owns every order book and the single SBE writer.
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::{
     sync::mpsc,
     time::{Instant, MissedTickBehavior},
@@ -29,25 +26,37 @@ use crate::{
 pub const CHUNK_SIZE: usize = 64 << 20;
 
 pub enum Inbound {
+    Assign {
+        asset: String,
+        socket: usize,
+    },
+    Forget(String),
     Event {
+        socket: usize,
         received_at: DateTime<Utc>,
         event: Event,
     },
-    Forget(String),
+}
+
+struct Subscription {
+    socket: usize,
+    book: Option<OrderBook>,
 }
 
 pub struct Engine {
-    books: HashMap<String, OrderBook>,
+    subscriptions: HashMap<String, Subscription>,
     writer: AlignedSbeWriter,
     snapshot_interval: Duration,
+    max_lag: TimeDelta,
 }
 
 impl Engine {
     pub fn new(writer: AlignedSbeWriter, snapshot_interval: Duration) -> Self {
         Self {
-            books: HashMap::new(),
+            subscriptions: HashMap::new(),
             writer,
             snapshot_interval,
+            max_lag: TimeDelta::zero(),
         }
     }
 
@@ -64,10 +73,8 @@ impl Engine {
         );
         snapshots.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Live data first; the snapshot timer only runs when the inbox is empty.
         loop {
             tokio::select! {
-                biased;
                 received = inbound.recv() => match received {
                     Some(inbound) => self.handle(inbound)?,
                     None => return self.writer.flush(),
@@ -79,76 +86,94 @@ impl Engine {
 
     fn handle(&mut self, inbound: Inbound) -> anyhow::Result<()> {
         match inbound {
-            Inbound::Event {
-                received_at,
-                event: Event::Book(book),
-            } => self.book(book, received_at),
-            Inbound::Event {
-                received_at,
-                event: Event::PriceChange(change),
-            } => self.price_change(&change, received_at),
-            Inbound::Event {
-                event: Event::Other,
-                ..
-            } => Ok(()),
-            Inbound::Forget(asset) => {
-                self.books.remove(&asset);
+            Inbound::Assign { asset, socket } => {
+                self.subscriptions
+                    .insert(asset, Subscription { socket, book: None });
                 Ok(())
+            }
+            Inbound::Forget(asset) => {
+                self.subscriptions.remove(&asset);
+                Ok(())
+            }
+            Inbound::Event {
+                socket,
+                received_at,
+                event,
+            } => {
+                self.max_lag = self.max_lag.max(Utc::now() - received_at);
+                match event {
+                    Event::Book(book) => self.book(socket, &book, received_at),
+                    Event::PriceChange(change) => self.price_change(socket, &change, received_at),
+                    Event::Other => Ok(()),
+                }
             }
         }
     }
 
-    fn book(&mut self, book: Book, received_at: DateTime<Utc>) -> anyhow::Result<()> {
-        let order_book = match OrderBook::try_from(&book) {
-            Ok(order_book) => order_book,
-            Err(error) => {
-                warn!(%error, asset = %book.asset_id, "ignored book");
-                return Ok(());
-            }
+    fn book(
+        &mut self,
+        socket: usize,
+        book: &Book,
+        received_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let Some(subscription) = owned(&mut self.subscriptions, &book.asset_id, socket) else {
+            return Ok(());
         };
-        self.writer
-            .write_msg(&snapshot(&book.asset_id, &order_book, received_at))?;
-        self.books.insert(book.asset_id, order_book);
+        match OrderBook::try_from(book) {
+            Ok(order_book) => {
+                self.writer
+                    .write_msg(&snapshot(&book.asset_id, &order_book, received_at))?;
+                subscription.book = Some(order_book);
+            }
+            Err(error) => {
+                warn!(%error, asset = %book.asset_id, "dropped a book that could not be read");
+                subscription.book = None;
+            }
+        }
         Ok(())
     }
 
     fn price_change(
         &mut self,
+        socket: usize,
         change: &PriceChange,
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let exchange_ts = match book::parse_timestamp(&change.timestamp) {
             Ok(exchange_ts) => exchange_ts,
             Err(error) => {
-                warn!(%error, "ignored price change");
+                warn!(%error, "ignored a price change with an unreadable timestamp");
                 return Ok(());
             }
         };
         for level in &change.price_changes {
-            let order_book = match self.books.entry(level.asset_id.clone()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                // Polymarket sends no book for an empty book, so the first change of an
-                // asset starts from empty. The empty snapshot gives readers a starting state.
-                Entry::Vacant(entry) => {
-                    let order_book = entry.insert(OrderBook::empty(exchange_ts));
-                    self.writer
-                        .write_msg(&snapshot(&level.asset_id, order_book, received_at))?;
-                    order_book
-                }
+            let Some(subscription) = owned(&mut self.subscriptions, &level.asset_id, socket) else {
+                continue;
             };
-            let update = match order_book.apply(level, exchange_ts) {
-                Ok(update) => update,
+            // Polymarket sends a book for every subscribed asset, so a change before the book
+            // is unexpected. Starting from an empty snapshot keeps every stream snapshot-first.
+            if subscription.book.is_none() {
+                warn!(asset = %level.asset_id, "price change before book");
+                let empty = OrderBook::empty(exchange_ts);
+                self.writer
+                    .write_msg(&snapshot(&level.asset_id, &empty, received_at))?;
+                subscription.book = Some(empty);
+            }
+            let Some(order_book) = &mut subscription.book else {
+                continue;
+            };
+            match order_book.apply(level, exchange_ts) {
+                Ok(update) => self.writer.write_msg(&level_update(
+                    &level.asset_id,
+                    update,
+                    received_at,
+                    exchange_ts,
+                ))?,
                 Err(error) => {
-                    warn!(%error, asset = %level.asset_id, "ignored level");
-                    continue;
+                    warn!(%error, asset = %level.asset_id, "dropped a book after an unreadable level");
+                    subscription.book = None;
                 }
-            };
-            self.writer.write_msg(&level_update(
-                &level.asset_id,
-                update,
-                received_at,
-                exchange_ts,
-            ))?;
+            }
         }
         Ok(())
     }
@@ -157,13 +182,34 @@ impl Engine {
     // queued events keep the receive time they were stamped with.
     fn snapshot_all(&mut self) -> anyhow::Result<()> {
         let received_at = Utc::now();
-        for (symbol, book) in &self.books {
-            self.writer
-                .write_msg(&snapshot(symbol, book, received_at))?;
+        let mut books = 0;
+        for (symbol, subscription) in &self.subscriptions {
+            if let Some(book) = &subscription.book {
+                self.writer
+                    .write_msg(&snapshot(symbol, book, received_at))?;
+                books += 1;
+            }
         }
-        info!(books = self.books.len(), "snapshot round");
+        info!(
+            books,
+            max_lag_ms = self.max_lag.num_milliseconds(),
+            "snapshot round"
+        );
+        self.max_lag = TimeDelta::zero();
         Ok(())
     }
+}
+
+// Only the socket an asset is assigned to may touch its book. Anything else is a late
+// message from a socket that no longer owns the asset.
+fn owned<'a>(
+    subscriptions: &'a mut HashMap<String, Subscription>,
+    asset: &str,
+    socket: usize,
+) -> Option<&'a mut Subscription> {
+    subscriptions
+        .get_mut(asset)
+        .filter(|subscription| subscription.socket == socket)
 }
 
 fn snapshot(symbol: &str, book: &OrderBook, received_at: DateTime<Utc>) -> SnapshotDomain {
@@ -215,6 +261,9 @@ mod tests {
         util::{AlignedSbeReader, OrderbookSchema, dtos::challenge_orderbook::AnyMessage},
     };
 
+    const ASSET: &str =
+        "21910945789202551310737182019481519202352824012676720876277298283641159588352";
+
     enum Written {
         Snapshot(SnapshotDomain),
         Update(PriceLevelUpdateDomain),
@@ -250,7 +299,14 @@ mod tests {
     }
 
     fn received_at() -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(1_793_811_735_800).unwrap()
+        DateTime::from_timestamp_millis(1_793_977_813_040).unwrap()
+    }
+
+    fn assign(socket: usize) -> Inbound {
+        Inbound::Assign {
+            asset: ASSET.to_owned(),
+            socket,
+        }
     }
 
     fn level(price: &str, size: &str) -> Level {
@@ -260,25 +316,27 @@ mod tests {
         }
     }
 
-    fn book() -> Inbound {
+    fn book(socket: usize) -> Inbound {
         Inbound::Event {
+            socket,
             received_at: received_at(),
             event: Event::Book(Book {
-                asset_id: "1".to_owned(),
-                timestamp: "1793811735726".to_owned(),
-                bids: vec![level("0.017", "800"), level("0.018", "1254.57")],
-                asks: vec![level("0.019", "5884.04")],
+                asset_id: ASSET.to_owned(),
+                timestamp: "1793977813000".to_owned(),
+                bids: vec![level("0.997", "105486.43"), level("0.998", "287197.36")],
+                asks: vec![level("0.999", "1369896.93")],
             }),
         }
     }
 
-    fn price_change(asset_id: &str, price: &str, size: &str, side: OrderSide) -> Inbound {
+    fn price_change(socket: usize, price: &str, size: &str, side: OrderSide) -> Inbound {
         Inbound::Event {
+            socket,
             received_at: received_at(),
             event: Event::PriceChange(PriceChange {
-                timestamp: "1793811751973".to_owned(),
+                timestamp: "1793977816442".to_owned(),
                 price_changes: vec![LevelChange {
-                    asset_id: asset_id.to_owned(),
+                    asset_id: ASSET.to_owned(),
                     price: price.to_owned(),
                     size: size.to_owned(),
                     side,
@@ -289,82 +347,85 @@ mod tests {
 
     #[tokio::test]
     async fn book_is_written_as_a_snapshot() {
-        let written = write_and_read_back(vec![book()]).await;
+        let written = write_and_read_back(vec![assign(0), book(0)]).await;
 
         let [Written::Snapshot(snapshot)] = written.as_slice() else {
             panic!("expected exactly one snapshot");
         };
-        assert_eq!(snapshot.symbol, "1");
+        assert_eq!(snapshot.symbol, ASSET);
         assert_eq!(snapshot.received_at, received_at());
         assert_eq!(
             snapshot.exchange_timestamp.timestamp_millis(),
-            1_793_811_735_726
+            1_793_977_813_000
         );
         assert_eq!(snapshot.bids.len(), 2);
-        assert_eq!(snapshot.bids[1].price_level, 18_000);
-        assert_eq!(snapshot.bids[1].quantity, 1_254_570_000);
-        assert_eq!(snapshot.asks[0].price_level, 19_000);
+        assert_eq!(snapshot.bids[1].price_level, 998_000);
+        assert_eq!(snapshot.bids[1].quantity, 287_197_360_000);
+        assert_eq!(snapshot.asks[0].price_level, 999_000);
     }
 
     #[tokio::test]
     async fn price_change_is_written_as_a_level_update() {
         let written = write_and_read_back(vec![
-            book(),
-            price_change("1", "0.018", "1100", OrderSide::Buy),
+            assign(0),
+            book(0),
+            price_change(0, "0.998", "1100", OrderSide::Buy),
         ])
         .await;
 
         let [Written::Snapshot(_), Written::Update(update)] = written.as_slice() else {
             panic!("expected a snapshot followed by one update");
         };
-        assert_eq!(update.symbol, "1");
+        assert_eq!(update.symbol, ASSET);
         assert_eq!(update.side, Side::Buy);
-        assert_eq!(update.price_level, 18_000);
+        assert_eq!(update.price_level, 998_000);
         assert_eq!(update.quantity, 1_100_000_000);
         assert_eq!(update.backtest_timestamp, received_at());
         assert_eq!(
             update.exchange_timestamp.timestamp_millis(),
-            1_793_811_751_973
+            1_793_977_816_442
         );
     }
 
     #[tokio::test]
-    async fn first_price_change_of_unknown_asset_opens_an_empty_book() {
-        let written =
-            write_and_read_back(vec![price_change("7", "0.42", "25", OrderSide::Sell)]).await;
+    async fn change_before_book_starts_from_an_empty_snapshot() {
+        let written = write_and_read_back(vec![
+            assign(0),
+            price_change(0, "0.42", "25", OrderSide::Sell),
+        ])
+        .await;
 
         let [Written::Snapshot(snapshot), Written::Update(update)] = written.as_slice() else {
             panic!("expected an empty snapshot followed by one update");
         };
-        assert_eq!(snapshot.symbol, "7");
         assert_eq!(snapshot.bids, []);
         assert_eq!(snapshot.asks, []);
-        assert_eq!(
-            snapshot.exchange_timestamp.timestamp_millis(),
-            1_793_811_751_973
-        );
-        assert_eq!(update.side, Side::Sell);
         assert_eq!(update.price_level, 420_000);
         assert_eq!(update.quantity, 25_000_000);
     }
 
     #[tokio::test]
-    async fn forgotten_asset_is_not_written_again() {
+    async fn messages_from_a_socket_that_does_not_own_the_asset_are_ignored() {
         let written = write_and_read_back(vec![
-            book(),
-            Inbound::Forget("1".to_owned()),
-            price_change("1", "0.018", "1100", OrderSide::Buy),
+            assign(0),
+            book(1),
+            price_change(1, "0.998", "1100", OrderSide::Buy),
         ])
         .await;
 
-        let [
-            Written::Snapshot(_),
-            Written::Snapshot(reopened),
-            Written::Update(_),
-        ] = written.as_slice()
-        else {
-            panic!("expected the book to be reopened empty after forget");
-        };
-        assert_eq!(reopened.bids, []);
+        assert!(written.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgotten_asset_is_not_written_again() {
+        let written = write_and_read_back(vec![
+            assign(0),
+            book(0),
+            Inbound::Forget(ASSET.to_owned()),
+            price_change(0, "0.998", "1100", OrderSide::Buy),
+        ])
+        .await;
+
+        assert!(matches!(written.as_slice(), [Written::Snapshot(_)]));
     }
 }

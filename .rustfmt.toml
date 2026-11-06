@@ -10,3 +10,6 @@ comment_width = 100
 wrap_comments = true
 newline_style = "Unix"
 use_field_init_shorthand = true
+
+# The template under src/util is vendored as-is.
+ignore = ["src/util"]

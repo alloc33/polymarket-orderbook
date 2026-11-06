@@ -13,11 +13,12 @@ use tracing::{debug, warn};
 
 use crate::{
     engine::Inbound,
-    polymarket::ws::{self, Event, Operation, Socket},
+    polymarket::ws::{self, Operation, Socket},
 };
 
 // Healthy sockets answer PING within a second, so 30 s without a frame means dead.
-// Writes get the same bound: a wedged send once blocked shutdown for good.
+// Connects and writes get the same bound so a peer that stops responding cannot
+// hold the task forever.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -29,6 +30,7 @@ pub enum Command {
 }
 
 pub async fn run(
+    id: usize,
     assets: Vec<String>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     engine: mpsc::UnboundedSender<Inbound>,
@@ -39,28 +41,31 @@ pub async fn run(
 
     loop {
         let started = Instant::now();
-        let error = match session(&mut subscribed, &mut commands, &engine, &shutdown).await {
+        let error = match session(id, &mut subscribed, &mut commands, &engine, &shutdown).await {
             Ok(socket) => return close(socket).await,
             Err(error) => error,
         };
         delay = next_delay(delay, started.elapsed());
-        warn!(%error, ?delay, "reconnecting");
+        warn!(socket = id, %error, ?delay, "reconnecting");
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            () = tokio::time::sleep(delay) => {}
+            () = tokio::time::sleep(delay + jitter()) => {}
         }
     }
 }
 
 async fn session(
+    id: usize,
     subscribed: &mut BTreeSet<String>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     engine: &mpsc::UnboundedSender<Inbound>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Socket> {
-    let mut socket = ws::connect().await?;
+    let mut socket = tokio::time::timeout(STALL_TIMEOUT, ws::connect())
+        .await
+        .context("connect stalled")??;
     send(&mut socket, ws::subscribe(subscribed)).await?;
-    debug!(assets = subscribed.len(), "subscribed");
+    debug!(socket = id, assets = subscribed.len(), "subscribed");
 
     let mut ping = tokio::time::interval(ws::PING_INTERVAL);
     let mut last_frame = Instant::now();
@@ -73,7 +78,7 @@ async fn session(
                 bail!("no frames for {STALL_TIMEOUT:?}")
             }
             Some(command) = commands.recv() => {
-                apply(command, &mut socket, subscribed, engine).await?;
+                apply(command, &mut socket, subscribed).await?;
             }
             frame = socket.next() => {
                 let received_at = Utc::now();
@@ -81,7 +86,7 @@ async fn session(
                 let Some(frame) = frame else { bail!("socket closed") };
                 match frame? {
                     Message::Text(text) if text.as_str() == ws::PONG => {}
-                    Message::Text(text) => dispatch(&text, received_at, subscribed, engine)?,
+                    Message::Text(text) => dispatch(&text, id, received_at, engine)?,
                     Message::Close(frame) => bail!("server closed the socket: {frame:?}"),
                     _ => {}
                 }
@@ -90,27 +95,25 @@ async fn session(
     }
 }
 
+// The set changes before the frame is sent: if the send fails, the reconnect
+// resubscribes from the set and the command is not lost.
 async fn apply(
     command: Command,
     socket: &mut Socket,
     subscribed: &mut BTreeSet<String>,
-    engine: &mpsc::UnboundedSender<Inbound>,
 ) -> anyhow::Result<()> {
     match command {
         Command::Subscribe(asset) => {
-            send(socket, ws::update(Operation::Subscribe, &asset)).await?;
+            let frame = ws::update(Operation::Subscribe, &asset);
             subscribed.insert(asset);
+            send(socket, frame).await
         }
         Command::Unsubscribe(asset) => {
-            send(socket, ws::update(Operation::Unsubscribe, &asset)).await?;
+            let frame = ws::update(Operation::Unsubscribe, &asset);
             subscribed.remove(&asset);
-            // Sent from here so it cannot overtake an update this socket already forwarded.
-            if engine.send(Inbound::Forget(asset)).is_err() {
-                bail!("engine stopped");
-            }
+            send(socket, frame).await
         }
     }
-    Ok(())
 }
 
 fn next_delay(delay: Duration, session_lasted: Duration) -> Duration {
@@ -119,6 +122,12 @@ fn next_delay(delay: Duration, session_lasted: Duration) -> Duration {
     } else {
         (delay * 2).min(MAX_RECONNECT_DELAY)
     }
+}
+
+// Spreads reconnects out so that an outage does not end with every socket
+// connecting in the same second.
+fn jitter() -> Duration {
+    Duration::from_millis(rand::random_range(0..1000))
 }
 
 async fn send(socket: &mut Socket, message: Message) -> anyhow::Result<()> {
@@ -149,30 +158,20 @@ async fn close(mut socket: Socket) -> anyhow::Result<()> {
 
 fn dispatch(
     frame: &str,
+    id: usize,
     received_at: DateTime<Utc>,
-    subscribed: &BTreeSet<String>,
     engine: &mpsc::UnboundedSender<Inbound>,
 ) -> anyhow::Result<()> {
-    let Ok(events) = ws::parse(frame).inspect_err(|error| warn!(%error, "unreadable frame")) else {
-        return Ok(());
-    };
-    // A price change is per market, so it also carries the sibling token's lines.
-    // Keeping only this socket's assets avoids duplicates when the sibling lives
-    // on another socket.
-    for mut event in events {
-        match &mut event {
-            Event::Book(book) if !subscribed.contains(&book.asset_id) => continue,
-            Event::PriceChange(change) => {
-                change
-                    .price_changes
-                    .retain(|level| subscribed.contains(&level.asset_id));
-                if change.price_changes.is_empty() {
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        if engine.send(Inbound::Event { received_at, event }).is_err() {
+    for event in ws::parse(frame) {
+        let Ok(event) = event.inspect_err(|error| warn!(%error, "unreadable event")) else {
+            continue;
+        };
+        let inbound = Inbound::Event {
+            socket: id,
+            received_at,
+            event,
+        };
+        if engine.send(inbound).is_err() {
             bail!("engine stopped");
         }
     }
@@ -183,52 +182,23 @@ fn dispatch(
 mod tests {
     use super::*;
 
-    fn price_change(assets: &[&str]) -> String {
-        let changes: Vec<_> = assets
-            .iter()
-            .map(|asset| {
-                serde_json::json!({"asset_id": asset, "price": "0.5", "size": "10", "side": "BUY"})
-            })
-            .collect();
-        serde_json::json!({
-            "event_type": "price_change",
-            "timestamp": "1793811751973",
-            "price_changes": changes
-        })
-        .to_string()
-    }
-
     #[test]
-    fn forwards_only_subscribed_assets() {
-        let subscribed = BTreeSet::from(["1".to_owned()]);
+    fn forwards_every_readable_event_tagged_with_the_socket() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let frame = r#"[
+            {"event_type": "book", "asset_id": "1", "timestamp": "1", "bids": [], "asks": []},
+            {"event_type": "book", "asset_id": 2},
+            {"event_type": "book", "asset_id": "3", "timestamp": "1", "bids": [], "asks": []}
+        ]"#;
 
-        dispatch(&price_change(&["1", "2"]), Utc::now(), &subscribed, &tx).unwrap();
+        dispatch(frame, 7, Utc::now(), &tx).unwrap();
 
-        let Inbound::Event {
-            event: Event::PriceChange(forwarded),
-            ..
-        } = rx.try_recv().unwrap()
-        else {
-            panic!("expected a price change");
-        };
-        assert_eq!(forwarded.price_changes.len(), 1);
-        assert_eq!(forwarded.price_changes[0].asset_id, "1");
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn drops_events_with_no_subscribed_assets() {
-        let subscribed = BTreeSet::from(["1".to_owned()]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let book = serde_json::json!({
-            "event_type": "book", "asset_id": "2", "timestamp": "1", "bids": [], "asks": []
-        })
-        .to_string();
-
-        dispatch(&price_change(&["2"]), Utc::now(), &subscribed, &tx).unwrap();
-        dispatch(&book, Utc::now(), &subscribed, &tx).unwrap();
-
+        for _ in 0..2 {
+            let Inbound::Event { socket, .. } = rx.try_recv().unwrap() else {
+                panic!("expected an event");
+            };
+            assert_eq!(socket, 7);
+        }
         assert!(rx.try_recv().is_err());
     }
 

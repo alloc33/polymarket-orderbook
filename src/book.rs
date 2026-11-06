@@ -29,7 +29,7 @@ pub struct LevelUpdate {
 }
 
 impl OrderBook {
-    pub const fn empty(exchange_ts: DateTime<Utc>) -> Self {
+    pub fn empty(exchange_ts: DateTime<Utc>) -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),

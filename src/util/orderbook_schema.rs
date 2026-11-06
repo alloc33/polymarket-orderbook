@@ -1,8 +1,6 @@
-use super::{
-    AlignedSbeSchema,
-    dtos::challenge_orderbook::{
-        AnyMessage, PriceLevelUpdateSchema, SCHEMA_ID, SCHEMA_VERSION, SnapshotSchema,
-    },
+use super::AlignedSbeSchema;
+use super::dtos::challenge_orderbook::{
+    AnyMessage, PriceLevelUpdateSchema, SCHEMA_ID, SCHEMA_VERSION, SnapshotSchema,
 };
 
 pub struct OrderbookSchema;

@@ -19,15 +19,6 @@ pub enum Placement {
     New(Vec<String>),
 }
 
-impl Placement {
-    pub const fn count(&self) -> usize {
-        match self {
-            Self::Existing { .. } => 1,
-            Self::New(assets) => assets.len(),
-        }
-    }
-}
-
 impl Balancer {
     pub fn new(per_socket: NonZeroUsize) -> Self {
         Self {

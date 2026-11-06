@@ -46,7 +46,18 @@ async fn main() -> anyhow::Result<()> {
     let writer = AlignedSbeWriter::create(&config.output, engine::CHUNK_SIZE)?;
     let (events, inbox) = mpsc::unbounded_channel();
     let engine = Engine::new(writer, Duration::from_secs(config.snapshot_interval));
-    let engine = tokio::spawn(engine.run(inbox, shutdown.clone()));
+    // The engine blocks on 64 MiB writes; on its own thread that never delays a socket.
+    let engine = std::thread::Builder::new()
+        .name("engine".to_owned())
+        .spawn({
+            let shutdown = shutdown.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()?
+                    .block_on(engine.run(inbox, shutdown))
+            }
+        })?;
 
     let mut collector = Collector::new(
         config.assets_per_socket,
@@ -66,6 +77,8 @@ async fn main() -> anyhow::Result<()> {
 
     shutdown.cancel();
     collector.close().await;
-    engine.await??;
+    engine
+        .join()
+        .map_err(|_| anyhow::anyhow!("engine thread panicked"))??;
     outcome
 }

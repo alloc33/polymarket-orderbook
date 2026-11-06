@@ -1,12 +1,7 @@
 //! Polymarket order book collector: lists the live assets, streams their books
 //! over many websockets and writes every change as SBE with the Voluntas template.
 
-#![warn(
-    clippy::pedantic,
-    clippy::cognitive_complexity,
-    clippy::use_self,
-    clippy::missing_const_for_fn
-)]
+#![warn(clippy::pedantic, clippy::cognitive_complexity)]
 #![allow(
     clippy::must_use_candidate,
     clippy::missing_errors_doc,

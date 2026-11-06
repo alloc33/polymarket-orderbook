@@ -2,11 +2,7 @@
 
 use std::{collections::HashSet, num::NonZeroUsize, time::Duration};
 
-use tokio::{
-    sync::mpsc,
-    task::JoinSet,
-    time::{Instant, MissedTickBehavior},
-};
+use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -52,15 +48,12 @@ impl Collector {
     }
 
     pub async fn run(&mut self, discovery_interval: Duration) -> anyhow::Result<()> {
-        self.refresh().await?;
-
-        let mut discovery =
-            tokio::time::interval_at(Instant::now() + discovery_interval, discovery_interval);
+        let mut discovery = tokio::time::interval(discovery_interval);
         discovery.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
-                // A failed round must not take the sockets down; the next tick tries again.
+                // A failed round keeps what it placed so far; the next tick finishes the job.
                 _ = discovery.tick() => {
                     if let Err(error) = self.refresh().await {
                         error!(%error, "discovery round failed");
@@ -100,14 +93,13 @@ impl Collector {
         let list = async move { rest::live_assets(&client, &listed).await };
 
         let mut current = HashSet::new();
-        let mut added = 0;
+        let before = self.balancer.count();
         let place = async {
             while let Some(asset) = listing.recv().await {
                 if !current.insert(asset.clone()) {
                     continue;
                 }
                 if let Some(placement) = self.balancer.add(asset) {
-                    added += placement.count();
                     self.place(placement);
                 }
                 if self.limit.is_some_and(|limit| current.len() >= limit) {
@@ -116,16 +108,17 @@ impl Collector {
             }
             listing.close();
             if let Some(placement) = self.balancer.flush() {
-                added += placement.count();
                 self.place(placement);
             }
             anyhow::Ok(())
         };
         tokio::try_join!(list, place)?;
+        let added = self.balancer.count() - before;
 
         let gone = self.balancer.gone(&current);
         for asset in &gone {
             if let Some(socket) = self.balancer.remove(asset) {
+                self.notify(Inbound::Forget(asset.clone()));
                 self.command(socket, Command::Unsubscribe(asset.clone()));
             }
         }
@@ -140,14 +133,27 @@ impl Collector {
         Ok(())
     }
 
+    // The engine learns who owns an asset before the socket can send anything about it.
     fn place(&mut self, placement: Placement) {
         match placement {
             Placement::Existing { socket, asset } => {
+                self.notify(Inbound::Assign {
+                    asset: asset.clone(),
+                    socket,
+                });
                 self.command(socket, Command::Subscribe(asset));
             }
             Placement::New(assets) => {
+                let socket = self.sockets.len();
+                for asset in &assets {
+                    self.notify(Inbound::Assign {
+                        asset: asset.clone(),
+                        socket,
+                    });
+                }
                 let (commands, inbox) = mpsc::unbounded_channel();
                 self.connections.spawn(connection::run(
+                    socket,
                     assets,
                     inbox,
                     self.engine.clone(),
@@ -162,5 +168,10 @@ impl Collector {
         if self.sockets[socket].send(command).is_err() {
             warn!(socket, "connection is gone, command dropped");
         }
+    }
+
+    // An engine that stopped has already cancelled the shutdown token.
+    fn notify(&self, inbound: Inbound) {
+        let _ = self.engine.send(inbound);
     }
 }
