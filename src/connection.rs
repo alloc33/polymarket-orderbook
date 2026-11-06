@@ -1,3 +1,6 @@
+//! One websocket: subscribes its assets, forwards events to the engine and
+//! reconnects for as long as the process runs.
+
 use std::{collections::BTreeSet, time::Duration};
 
 use anyhow::{Context, bail};
@@ -13,6 +16,8 @@ use crate::{
     polymarket::ws::{self, Event, Operation, Socket},
 };
 
+// Healthy sockets answer PING within a second, so 30 s without a frame means dead.
+// Writes get the same bound: a wedged send once blocked shutdown for good.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -67,19 +72,9 @@ async fn session(
             () = tokio::time::sleep_until(last_frame + STALL_TIMEOUT) => {
                 bail!("no frames for {STALL_TIMEOUT:?}")
             }
-            Some(command) = commands.recv() => match command {
-                Command::Subscribe(asset) => {
-                    send(&mut socket, ws::update(Operation::Subscribe, &asset)).await?;
-                    subscribed.insert(asset);
-                }
-                Command::Unsubscribe(asset) => {
-                    send(&mut socket, ws::update(Operation::Unsubscribe, &asset)).await?;
-                    subscribed.remove(&asset);
-                    if engine.send(Inbound::Forget(asset)).is_err() {
-                        bail!("engine stopped");
-                    }
-                }
-            },
+            Some(command) = commands.recv() => {
+                apply(command, &mut socket, subscribed, engine).await?;
+            }
             frame = socket.next() => {
                 let received_at = Utc::now();
                 last_frame = Instant::now();
@@ -93,6 +88,29 @@ async fn session(
             }
         }
     }
+}
+
+async fn apply(
+    command: Command,
+    socket: &mut Socket,
+    subscribed: &mut BTreeSet<String>,
+    engine: &mpsc::UnboundedSender<Inbound>,
+) -> anyhow::Result<()> {
+    match command {
+        Command::Subscribe(asset) => {
+            send(socket, ws::update(Operation::Subscribe, &asset)).await?;
+            subscribed.insert(asset);
+        }
+        Command::Unsubscribe(asset) => {
+            send(socket, ws::update(Operation::Unsubscribe, &asset)).await?;
+            subscribed.remove(&asset);
+            // Sent from here so it cannot overtake an update this socket already forwarded.
+            if engine.send(Inbound::Forget(asset)).is_err() {
+                bail!("engine stopped");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn next_delay(delay: Duration, session_lasted: Duration) -> Duration {
@@ -120,9 +138,10 @@ async fn close(mut socket: Socket) -> anyhow::Result<()> {
         }
         anyhow::Ok(())
     };
-    match tokio::time::timeout(CLOSE_TIMEOUT, handshake).await {
-        Ok(result) => result?,
-        Err(_) => warn!("close handshake timed out"),
+    if let Ok(result) = tokio::time::timeout(CLOSE_TIMEOUT, handshake).await {
+        result?;
+    } else {
+        warn!("close handshake timed out");
     }
     debug!("socket closed");
     Ok(())
@@ -134,13 +153,12 @@ fn dispatch(
     subscribed: &BTreeSet<String>,
     engine: &mpsc::UnboundedSender<Inbound>,
 ) -> anyhow::Result<()> {
-    let events = match ws::parse(frame) {
-        Ok(events) => events,
-        Err(error) => {
-            warn!(%error, "unreadable frame");
-            return Ok(());
-        }
+    let Ok(events) = ws::parse(frame).inspect_err(|error| warn!(%error, "unreadable frame")) else {
+        return Ok(());
     };
+    // A price change is per market, so it also carries the sibling token's lines.
+    // Keeping only this socket's assets avoids duplicates when the sibling lives
+    // on another socket.
     for mut event in events {
         match &mut event {
             Event::Book(book) if !subscribed.contains(&book.asset_id) => continue,

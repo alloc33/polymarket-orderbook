@@ -1,3 +1,5 @@
+//! Assigns assets to websockets, filling spare capacity before opening new ones.
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
@@ -14,14 +16,14 @@ pub struct Balancer {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placement {
     Existing { socket: usize, asset: String },
-    New { socket: usize, assets: Vec<String> },
+    New(Vec<String>),
 }
 
 impl Placement {
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         match self {
             Self::Existing { .. } => 1,
-            Self::New { assets, .. } => assets.len(),
+            Self::New(assets) => assets.len(),
         }
     }
 }
@@ -70,7 +72,7 @@ impl Balancer {
         if assets.len() < self.per_socket.get() {
             self.spare.insert(socket);
         }
-        Some(Placement::New { socket, assets })
+        Some(Placement::New(assets))
     }
 
     pub fn remove(&mut self, asset: &str) -> Option<usize> {
@@ -112,19 +114,10 @@ mod tests {
         assert_eq!(balancer.add("a".to_owned()), None);
         assert_eq!(
             balancer.add("b".to_owned()),
-            Some(Placement::New {
-                socket: 0,
-                assets: owned(&["a", "b"])
-            })
+            Some(Placement::New(owned(&["a", "b"])))
         );
         assert_eq!(balancer.add("c".to_owned()), None);
-        assert_eq!(
-            balancer.flush(),
-            Some(Placement::New {
-                socket: 1,
-                assets: owned(&["c"])
-            })
-        );
+        assert_eq!(balancer.flush(), Some(Placement::New(owned(&["c"]))));
         assert_eq!(balancer.flush(), None);
         assert_eq!(balancer.count(), 3);
     }

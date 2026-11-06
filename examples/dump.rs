@@ -1,3 +1,7 @@
+//! Reads an output file back with the template reader and prints a summary.
+
+#![warn(clippy::pedantic)]
+
 use std::path::PathBuf;
 
 use polymarket_orderbook::util::{

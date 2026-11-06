@@ -1,3 +1,5 @@
+//! In-memory order book in the fixed-point representation of the SBE schema.
+
 use std::collections::BTreeMap;
 
 use anyhow::{Context, ensure};
@@ -8,6 +10,7 @@ use crate::{
     polymarket::ws::{Book, Level, LevelChange, OrderSide},
 };
 
+// 1_000_000 is one dollar or one share, as the SBE schema defines.
 const DECIMALS: u32 = 6;
 pub const SCALE: i64 = 10_i64.pow(DECIMALS);
 
@@ -26,7 +29,7 @@ pub struct LevelUpdate {
 }
 
 impl OrderBook {
-    pub fn empty(exchange_ts: DateTime<Utc>) -> Self {
+    pub const fn empty(exchange_ts: DateTime<Utc>) -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
@@ -47,6 +50,7 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
+        // Polymarket sends the new total at the level, not a delta; zero removes it.
         if quantity == 0 {
             levels.remove(&price);
         } else {
@@ -59,14 +63,6 @@ impl OrderBook {
             price,
             quantity,
         })
-    }
-
-    pub fn best_bid(&self) -> Option<i64> {
-        self.bids.keys().next_back().copied()
-    }
-
-    pub fn best_ask(&self) -> Option<i64> {
-        self.asks.keys().next().copied()
     }
 }
 
@@ -201,8 +197,6 @@ mod tests {
             BTreeMap::from([(19_000, 5_884_040_000), (25_000, 400_000_000)])
         );
         assert_eq!(book.exchange_ts.timestamp_millis(), 1_793_811_735_726);
-        assert_eq!(book.best_bid(), Some(18_000));
-        assert_eq!(book.best_ask(), Some(19_000));
     }
 
     #[test]
@@ -238,11 +232,11 @@ mod tests {
         book.apply(&change("0.019", "0", OrderSide::Sell), ts)
             .unwrap();
         assert!(!book.asks.contains_key(&19_000));
-        assert_eq!(book.best_ask(), Some(21_000));
+        assert_eq!(book.asks.keys().next(), Some(&21_000));
     }
 
     #[test]
-    fn empty_sides_have_no_best_price() {
+    fn empty_book_message_becomes_empty_book() {
         let book = OrderBook::try_from(&Book {
             asset_id: "1".to_owned(),
             timestamp: "0".to_owned(),
@@ -251,7 +245,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(book.best_bid(), None);
-        assert_eq!(book.best_ask(), None);
+        assert!(book.bids.is_empty());
+        assert!(book.asks.is_empty());
     }
 }

@@ -1,3 +1,5 @@
+//! Keeps the subscribed set equal to Polymarket's live assets.
+
 use std::{collections::HashSet, num::NonZeroUsize, time::Duration};
 
 use tokio::{
@@ -16,6 +18,7 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Sockets that cannot close politely in time are aborted.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Collector {
@@ -57,7 +60,12 @@ impl Collector {
 
         loop {
             tokio::select! {
-                _ = discovery.tick() => self.refresh().await?,
+                // A failed round must not take the sockets down; the next tick tries again.
+                _ = discovery.tick() => {
+                    if let Err(error) = self.refresh().await {
+                        error!(%error, "discovery round failed");
+                    }
+                }
                 Some(result) = self.connections.join_next() => {
                     if let Err(error) = result? {
                         error!(%error, "connection failed");
@@ -137,7 +145,7 @@ impl Collector {
             Placement::Existing { socket, asset } => {
                 self.command(socket, Command::Subscribe(asset));
             }
-            Placement::New { assets, .. } => {
+            Placement::New(assets) => {
                 let (commands, inbox) = mpsc::unbounded_channel();
                 self.connections.spawn(connection::run(
                     assets,

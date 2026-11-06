@@ -1,3 +1,7 @@
+//! Command line entry point: wires the engine and the collector together.
+
+#![warn(clippy::pedantic)]
+
 use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use clap::Parser;
@@ -13,14 +17,19 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 struct Config {
+    /// Where to write the SBE stream
     #[arg(long, default_value = "/dev/stdout")]
     output: PathBuf,
+    /// How often to write a full snapshot of every book
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     snapshot_interval: u64,
+    /// How often to re-list the live assets and adjust subscriptions
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
     discovery_interval: u64,
+    /// Assets per websocket; 100 is the most that still gets every initial book promptly
     #[arg(long, default_value = "100")]
     assets_per_socket: NonZeroUsize,
+    /// Subscribe only the first N listed assets (for testing)
     #[arg(long)]
     limit: Option<usize>,
 }
@@ -33,12 +42,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let config = Config::parse();
 
+    let shutdown = CancellationToken::new();
     let writer = AlignedSbeWriter::create(&config.output, engine::CHUNK_SIZE)?;
     let (events, inbox) = mpsc::unbounded_channel();
     let engine = Engine::new(writer, Duration::from_secs(config.snapshot_interval));
-    let engine = tokio::spawn(engine.run(inbox));
+    let engine = tokio::spawn(engine.run(inbox, shutdown.clone()));
 
-    let shutdown = CancellationToken::new();
     let mut collector = Collector::new(
         config.assets_per_socket,
         config.limit,
@@ -47,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let outcome = tokio::select! {
         result = collector.run(Duration::from_secs(config.discovery_interval)) => result,
+        () = shutdown.cancelled() => Ok(()),
         signal = tokio::signal::ctrl_c() => {
             signal?;
             info!("shutting down");

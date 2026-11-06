@@ -1,7 +1,11 @@
+//! Lists Polymarket's live assets through the Gamma API.
+
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+// Events nest their markets, so one page carries ~900 markets; the markets endpoint
+// gives 100 per page and caps offset pagination at 2000.
 const EVENTS_URL: &str = "https://gamma-api.polymarket.com/events/keyset";
 const PAGE_LIMIT: &str = "100";
 const ATTEMPTS: u32 = 3;
@@ -25,6 +29,7 @@ struct Market {
     accepting_orders: bool,
     #[serde(default)]
     enable_order_book: bool,
+    // A JSON array encoded as a string.
     clob_token_ids: Option<String>,
 }
 
@@ -51,6 +56,7 @@ pub async fn live_assets(
 
         for market in page.events.iter().flat_map(|event| &event.markets) {
             for asset in market.assets()? {
+                // The receiver stopped listening (--limit); nothing more to fetch.
                 if assets.send(asset).is_err() {
                     return Ok(());
                 }

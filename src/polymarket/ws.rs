@@ -1,3 +1,5 @@
+//! Polymarket's market websocket: connection, commands and message shapes.
+
 use std::{collections::BTreeSet, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -5,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 const URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+// Application-level heartbeat; the server answers with PONG.
 pub const PING: &str = "PING";
 pub const PONG: &str = "PONG";
 pub const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -26,13 +29,14 @@ pub fn update(operation: Operation, asset_id: &str) -> Message {
     )
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum Operation {
     Subscribe,
     Unsubscribe,
 }
 
+// The initial books of a subscription arrive as one array frame.
 pub fn parse(frame: &str) -> serde_json::Result<Vec<Event>> {
     if frame.starts_with('[') {
         serde_json::from_str(frame)
