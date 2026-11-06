@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -16,7 +16,7 @@ pub async fn connect() -> anyhow::Result<Socket> {
     Ok(socket)
 }
 
-pub fn subscribe(assets_ids: &[String]) -> Message {
+pub fn subscribe(assets_ids: &BTreeSet<String>) -> Message {
     Message::text(serde_json::json!({ "assets_ids": assets_ids, "type": "market" }).to_string())
 }
 
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn subscribe_message_has_documented_shape() {
-        let assets = ["123".to_owned(), "456".to_owned()];
+        let assets = BTreeSet::from(["123".to_owned(), "456".to_owned()]);
 
         let message = subscribe(&assets).into_text().unwrap();
         let json: serde_json::Value = serde_json::from_str(message.as_str()).unwrap();
