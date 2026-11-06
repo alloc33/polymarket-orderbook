@@ -1,6 +1,6 @@
-//! Keeps the subscribed set equal to Polymarket's live assets.
+//! Keeps the subscribed set equal to the exchange's live assets.
 
-use std::{collections::HashSet, num::NonZeroUsize, time::Duration};
+use std::{collections::HashSet, marker::PhantomData, num::NonZeroUsize, time::Duration};
 
 use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -10,37 +10,44 @@ use crate::{
     balancer::{Balancer, Placement},
     connection::{self, Command},
     engine::Inbound,
-    polymarket::rest,
+    exchange::Exchange,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // Sockets that cannot close politely in time are aborted.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub struct Collector {
+pub struct Collector<E> {
+    exchange: PhantomData<E>,
     client: reqwest::Client,
+    sockets_per_group: NonZeroUsize,
     limit: Option<usize>,
     balancer: Balancer,
     sockets: Vec<mpsc::UnboundedSender<Command>>,
+    groups: Vec<Vec<usize>>,
     connections: JoinSet<anyhow::Result<()>>,
     engine: mpsc::UnboundedSender<Inbound>,
     shutdown: CancellationToken,
 }
 
-impl Collector {
+impl<E: Exchange> Collector<E> {
     pub fn new(
-        per_socket: NonZeroUsize,
+        assets_per_group: NonZeroUsize,
+        sockets_per_group: NonZeroUsize,
         limit: Option<usize>,
         engine: mpsc::UnboundedSender<Inbound>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            exchange: PhantomData,
             client: reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()?,
+            sockets_per_group,
             limit,
-            balancer: Balancer::new(per_socket),
+            balancer: Balancer::new(assets_per_group),
             sockets: Vec::new(),
+            groups: Vec::new(),
             connections: JoinSet::new(),
             engine,
             shutdown,
@@ -90,7 +97,7 @@ impl Collector {
     async fn refresh(&mut self) -> anyhow::Result<()> {
         let (listed, mut listing) = mpsc::unbounded_channel();
         let client = self.client.clone();
-        let list = async move { rest::live_assets(&client, &listed).await };
+        let list = async move { E::list_assets(&client, &listed).await };
 
         let mut current = HashSet::new();
         let before = self.balancer.count();
@@ -117,9 +124,9 @@ impl Collector {
 
         let gone = self.balancer.gone(&current);
         for asset in &gone {
-            if let Some(socket) = self.balancer.remove(asset) {
+            if let Some(group) = self.balancer.remove(asset) {
                 self.notify(Inbound::Forget(asset.clone()));
-                self.command(socket, Command::Unsubscribe(asset.clone()));
+                self.command(group, &Command::Unsubscribe(asset.clone()));
             }
         }
 
@@ -133,40 +140,46 @@ impl Collector {
         Ok(())
     }
 
-    // The engine learns who owns an asset before the socket can send anything about it.
+    // The engine learns which sockets carry an asset before any of them can send.
     fn place(&mut self, placement: Placement) {
         match placement {
-            Placement::Existing { socket, asset } => {
+            Placement::Existing { group, asset } => {
                 self.notify(Inbound::Assign {
                     asset: asset.clone(),
-                    socket,
+                    sockets: self.groups[group].clone(),
                 });
-                self.command(socket, Command::Subscribe(asset));
+                self.command(group, &Command::Subscribe(asset));
             }
             Placement::New(assets) => {
-                let socket = self.sockets.len();
+                let first = self.sockets.len();
+                let sockets: Vec<usize> = (first..first + self.sockets_per_group.get()).collect();
                 for asset in &assets {
                     self.notify(Inbound::Assign {
                         asset: asset.clone(),
-                        socket,
+                        sockets: sockets.clone(),
                     });
                 }
-                let (commands, inbox) = mpsc::unbounded_channel();
-                self.connections.spawn(connection::run(
-                    socket,
-                    assets,
-                    inbox,
-                    self.engine.clone(),
-                    self.shutdown.clone(),
-                ));
-                self.sockets.push(commands);
+                for &socket in &sockets {
+                    let (commands, inbox) = mpsc::unbounded_channel();
+                    self.connections.spawn(connection::run::<E>(
+                        socket,
+                        assets.clone(),
+                        inbox,
+                        self.engine.clone(),
+                        self.shutdown.clone(),
+                    ));
+                    self.sockets.push(commands);
+                }
+                self.groups.push(sockets);
             }
         }
     }
 
-    fn command(&self, socket: usize, command: Command) {
-        if self.sockets[socket].send(command).is_err() {
-            warn!(socket, "connection is gone, command dropped");
+    fn command(&self, group: usize, command: &Command) {
+        for &socket in &self.groups[group] {
+            if self.sockets[socket].send(command.clone()).is_err() {
+                warn!(socket, "connection is gone, command dropped");
+            }
         }
     }
 

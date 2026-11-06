@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::{
     engine::Inbound,
-    polymarket::ws::{self, Operation, Socket},
+    exchange::{Exchange, Operation, Socket},
 };
 
 // Healthy sockets answer PING within a second, so 30 s without a frame means dead.
@@ -24,12 +24,13 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
 pub enum Command {
     Subscribe(String),
     Unsubscribe(String),
 }
 
-pub async fn run(
+pub async fn run<E: Exchange>(
     id: usize,
     assets: Vec<String>,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -41,10 +42,13 @@ pub async fn run(
 
     loop {
         let started = Instant::now();
-        let error = match session(id, &mut subscribed, &mut commands, &engine, &shutdown).await {
+        let error = match session::<E>(id, &mut subscribed, &mut commands, &engine, &shutdown).await
+        {
             Ok(socket) => return close(socket).await,
             Err(error) => error,
         };
+        // Tells the engine right away so a redundant socket can take over.
+        let _ = engine.send(Inbound::Down(id));
         delay = next_delay(delay, started.elapsed());
         warn!(socket = id, %error, ?delay, "reconnecting");
         tokio::select! {
@@ -54,39 +58,43 @@ pub async fn run(
     }
 }
 
-async fn session(
+async fn session<E: Exchange>(
     id: usize,
     subscribed: &mut BTreeSet<String>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     engine: &mpsc::UnboundedSender<Inbound>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Socket> {
-    let mut socket = tokio::time::timeout(STALL_TIMEOUT, ws::connect())
+    let mut socket = tokio::time::timeout(STALL_TIMEOUT, E::connect())
         .await
         .context("connect stalled")??;
-    send(&mut socket, ws::subscribe(subscribed)).await?;
+    send(&mut socket, E::subscribe(subscribed)).await?;
     debug!(socket = id, assets = subscribed.len(), "subscribed");
 
-    let mut ping = tokio::time::interval(ws::PING_INTERVAL);
+    let mut heartbeat = tokio::time::interval(E::HEARTBEAT_INTERVAL);
     let mut last_frame = Instant::now();
 
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(socket),
-            _ = ping.tick() => send(&mut socket, Message::text(ws::PING)).await?,
+            _ = heartbeat.tick() => send(&mut socket, E::heartbeat()).await?,
             () = tokio::time::sleep_until(last_frame + STALL_TIMEOUT) => {
                 bail!("no frames for {STALL_TIMEOUT:?}")
             }
             Some(command) = commands.recv() => {
-                apply(command, &mut socket, subscribed).await?;
+                apply::<E>(command, &mut socket, subscribed).await?;
             }
             frame = socket.next() => {
                 let received_at = Utc::now();
                 last_frame = Instant::now();
                 let Some(frame) = frame else { bail!("socket closed") };
-                match frame? {
-                    Message::Text(text) if text.as_str() == ws::PONG => {}
-                    Message::Text(text) => dispatch(&text, id, received_at, engine)?,
+                let frame = frame?;
+                if E::is_heartbeat_reply(&frame) {
+                    let _ = engine.send(Inbound::Alive(id));
+                    continue;
+                }
+                match frame {
+                    Message::Text(text) => dispatch::<E>(&text, id, received_at, engine)?,
                     Message::Close(frame) => bail!("server closed the socket: {frame:?}"),
                     _ => {}
                 }
@@ -97,19 +105,19 @@ async fn session(
 
 // The set changes before the frame is sent: if the send fails, the reconnect
 // resubscribes from the set and the command is not lost.
-async fn apply(
+async fn apply<E: Exchange>(
     command: Command,
     socket: &mut Socket,
     subscribed: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     match command {
         Command::Subscribe(asset) => {
-            let frame = ws::update(Operation::Subscribe, &asset);
+            let frame = E::update(Operation::Subscribe, &asset);
             subscribed.insert(asset);
             send(socket, frame).await
         }
         Command::Unsubscribe(asset) => {
-            let frame = ws::update(Operation::Unsubscribe, &asset);
+            let frame = E::update(Operation::Unsubscribe, &asset);
             subscribed.remove(&asset);
             send(socket, frame).await
         }
@@ -156,13 +164,13 @@ async fn close(mut socket: Socket) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dispatch(
+fn dispatch<E: Exchange>(
     frame: &str,
     id: usize,
     received_at: DateTime<Utc>,
     engine: &mpsc::UnboundedSender<Inbound>,
 ) -> anyhow::Result<()> {
-    for event in ws::parse(frame) {
+    for event in E::decode(frame) {
         let Ok(event) = event.inspect_err(|error| warn!(%error, "unreadable event")) else {
             continue;
         };
@@ -181,6 +189,7 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::polymarket::Polymarket;
 
     #[test]
     fn forwards_every_readable_event_tagged_with_the_socket() {
@@ -191,7 +200,7 @@ mod tests {
             {"event_type": "book", "asset_id": "3", "timestamp": "1", "bids": [], "asks": []}
         ]"#;
 
-        dispatch(frame, 7, Utc::now(), &tx).unwrap();
+        dispatch::<Polymarket>(frame, 7, Utc::now(), &tx).unwrap();
 
         for _ in 0..2 {
             let Inbound::Event { socket, .. } = rx.try_recv().unwrap() else {

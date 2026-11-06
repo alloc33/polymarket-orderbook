@@ -14,6 +14,9 @@ pub mod book;
 pub mod collector;
 pub mod connection;
 pub mod engine;
+pub mod event;
+pub mod exchange;
+pub mod fixed;
 pub mod polymarket;
 
 // The template modules are vendored as-is and keep their own lint settings.

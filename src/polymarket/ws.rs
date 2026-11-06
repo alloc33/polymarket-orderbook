@@ -1,19 +1,25 @@
-//! Polymarket's market websocket: connection, commands and message shapes.
+//! Polymarket's market websocket: connection, commands, and decoding its messages
+//! into exchange-neutral events.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::value::RawValue;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use crate::{
+    Side,
+    event::{Event, Level, Snapshot, Update},
+    exchange::{Operation, Socket},
+    fixed,
+};
 
 const URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 // Application-level heartbeat; the server answers with PONG.
 pub const PING: &str = "PING";
 pub const PONG: &str = "PONG";
-pub const PING_INTERVAL: Duration = Duration::from_secs(10);
-
-pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub async fn connect() -> anyhow::Result<Socket> {
     let (socket, _) = connect_async(URL).await?;
@@ -25,21 +31,30 @@ pub fn subscribe(assets_ids: &BTreeSet<String>) -> Message {
 }
 
 pub fn update(operation: Operation, asset_id: &str) -> Message {
+    let operation = match operation {
+        Operation::Subscribe => "subscribe",
+        Operation::Unsubscribe => "unsubscribe",
+    };
     Message::text(
         serde_json::json!({ "operation": operation, "assets_ids": [asset_id] }).to_string(),
     )
 }
 
-#[derive(Serialize, Debug, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum Operation {
-    Subscribe,
-    Unsubscribe,
+pub fn decode(frame: &str) -> Vec<anyhow::Result<Event>> {
+    parse(frame)
+        .into_iter()
+        .flat_map(|message| match message {
+            Ok(WireEvent::Book(book)) => vec![snapshot(book)],
+            Ok(WireEvent::PriceChange(change)) => updates(change),
+            Ok(WireEvent::Other) => Vec::new(),
+            Err(error) => vec![Err(error.into())],
+        })
+        .collect()
 }
 
 // The initial books of a subscription arrive as one array frame. Its elements are
 // decoded one by one so that a single bad element does not cost the other books.
-pub fn parse(frame: &str) -> Vec<serde_json::Result<Event>> {
+fn parse(frame: &str) -> Vec<serde_json::Result<WireEvent>> {
     if !frame.starts_with('[') {
         return vec![serde_json::from_str(frame)];
     }
@@ -52,9 +67,58 @@ pub fn parse(frame: &str) -> Vec<serde_json::Result<Event>> {
     }
 }
 
+fn snapshot(book: Book) -> anyhow::Result<Event> {
+    Ok(Event::Snapshot(Snapshot {
+        asset: book.asset_id,
+        exchange_ts: timestamp(&book.timestamp)?,
+        bids: levels(&book.bids)?,
+        asks: levels(&book.asks)?,
+    }))
+}
+
+fn updates(change: PriceChange) -> Vec<anyhow::Result<Event>> {
+    let exchange_ts = match timestamp(&change.timestamp) {
+        Ok(exchange_ts) => exchange_ts,
+        Err(error) => return vec![Err(error)],
+    };
+    change
+        .price_changes
+        .into_iter()
+        .map(|line| {
+            Ok(Event::Update(Update {
+                asset: line.asset_id,
+                exchange_ts,
+                side: line.side.into(),
+                price: fixed::parse(&line.price)?,
+                quantity: fixed::parse(&line.size)?,
+            }))
+        })
+        .collect()
+}
+
+fn levels(levels: &[WireLevel]) -> anyhow::Result<Vec<Level>> {
+    levels
+        .iter()
+        .map(|level| {
+            Ok(Level {
+                price: fixed::parse(&level.price)?,
+                quantity: fixed::parse(&level.size)?,
+            })
+        })
+        .collect()
+}
+
+fn timestamp(millis: &str) -> anyhow::Result<DateTime<Utc>> {
+    let millis: i64 = millis
+        .parse()
+        .with_context(|| format!("invalid timestamp: {millis}"))?;
+    DateTime::from_timestamp_millis(millis)
+        .with_context(|| format!("timestamp out of range: {millis}"))
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum Event {
+enum WireEvent {
     Book(Book),
     PriceChange(PriceChange),
     #[serde(other)]
@@ -62,38 +126,47 @@ pub enum Event {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct Book {
-    pub asset_id: String,
-    pub timestamp: String,
-    pub bids: Vec<Level>,
-    pub asks: Vec<Level>,
+struct Book {
+    asset_id: String,
+    timestamp: String,
+    bids: Vec<WireLevel>,
+    asks: Vec<WireLevel>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct Level {
-    pub price: String,
-    pub size: String,
+struct WireLevel {
+    price: String,
+    size: String,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PriceChange {
-    pub timestamp: String,
-    pub price_changes: Vec<LevelChange>,
+struct PriceChange {
+    timestamp: String,
+    price_changes: Vec<LineChange>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct LevelChange {
-    pub asset_id: String,
-    pub price: String,
-    pub size: String,
-    pub side: OrderSide,
+struct LineChange {
+    asset_id: String,
+    price: String,
+    size: String,
+    side: OrderSide,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum OrderSide {
+enum OrderSide {
     Buy,
     Sell,
+}
+
+impl From<OrderSide> for Side {
+    fn from(side: OrderSide) -> Self {
+        match side {
+            OrderSide::Buy => Self::Buy,
+            OrderSide::Sell => Self::Sell,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +186,19 @@ mod tests {
                  "bids": [{{"price": "0.997", "size": "105486.43"}}, {{"price": "0.998", "size": "287197.36"}}],
                  "asks": [{{"price": "0.999", "size": "1369896.93"}}],
                  "tick_size": "0.001", "event_type": "book", "last_trade_price": "0.001"}}"#
+        )
+    }
+
+    fn price_change_frame() -> String {
+        format!(
+            r#"{{"market": "0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6",
+                 "price_changes": [
+                   {{"asset_id": "{YES}", "price": "0.001", "size": "375524.83", "side": "BUY",
+                     "hash": "2634bcad884ee13ca02ab150925aca28178c1f0f", "best_bid": "0.02", "best_ask": "0.023"}},
+                   {{"asset_id": "{NO}", "price": "0.999", "size": "375524.83", "side": "SELL",
+                     "hash": "3245c13d127b56144513277772f7dccd602648b8", "best_bid": "0.977", "best_ask": "0.98"}}
+                 ],
+                 "timestamp": "1793977816442", "event_type": "price_change"}}"#
         )
     }
 
@@ -141,52 +227,43 @@ mod tests {
     }
 
     #[test]
-    fn book_event_parses() {
-        let Event::Book(book) = serde_json::from_str(&book_frame(YES)).unwrap() else {
-            panic!("expected a book event");
-        };
+    fn book_decodes_to_a_snapshot() {
+        let decoded = decode(&book_frame(YES));
 
-        assert_eq!(book.asset_id, YES);
-        assert_eq!(book.timestamp, "1793977813000");
-        assert_eq!(book.bids.len(), 2);
-        assert_eq!(book.bids[1].price, "0.998");
-        assert_eq!(book.bids[1].size, "287197.36");
-        assert_eq!(book.asks.len(), 1);
+        let [Ok(Event::Snapshot(snapshot))] = decoded.as_slice() else {
+            panic!("expected one snapshot");
+        };
+        assert_eq!(snapshot.asset, YES);
+        assert_eq!(snapshot.exchange_ts.timestamp_millis(), 1_793_977_813_000);
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.bids[1].price, 998_000);
+        assert_eq!(snapshot.bids[1].quantity, 287_197_360_000);
+        assert_eq!(snapshot.asks[0].price, 999_000);
     }
 
     #[test]
-    fn price_change_event_parses() {
-        let frame = format!(
-            r#"{{"market": "0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6",
-                 "price_changes": [
-                   {{"asset_id": "{YES}", "price": "0.001", "size": "375524.83", "side": "BUY",
-                     "hash": "2634bcad884ee13ca02ab150925aca28178c1f0f", "best_bid": "0.02", "best_ask": "0.023"}},
-                   {{"asset_id": "{NO}", "price": "0.999", "size": "375524.83", "side": "SELL",
-                     "hash": "3245c13d127b56144513277772f7dccd602648b8", "best_bid": "0.977", "best_ask": "0.98"}}
-                 ],
-                 "timestamp": "1793977816442", "event_type": "price_change"}}"#
-        );
+    fn price_change_decodes_to_one_update_per_line() {
+        let decoded = decode(&price_change_frame());
 
-        let Event::PriceChange(change) = serde_json::from_str(&frame).unwrap() else {
-            panic!("expected a price change event");
+        let [Ok(Event::Update(yes)), Ok(Event::Update(no))] = decoded.as_slice() else {
+            panic!("expected two updates");
         };
-
-        assert_eq!(change.timestamp, "1793977816442");
-        assert_eq!(change.price_changes.len(), 2);
-        assert_eq!(change.price_changes[0].asset_id, YES);
-        assert_eq!(change.price_changes[0].side, OrderSide::Buy);
-        assert_eq!(change.price_changes[0].size, "375524.83");
-        assert_eq!(change.price_changes[1].side, OrderSide::Sell);
-        assert_eq!(change.price_changes[1].price, "0.999");
+        assert_eq!(yes.asset, YES);
+        assert_eq!(yes.exchange_ts.timestamp_millis(), 1_793_977_816_442);
+        assert_eq!(yes.side, Side::Buy);
+        assert_eq!(yes.price, 1_000);
+        assert_eq!(yes.quantity, 375_524_830_000);
+        assert_eq!(no.asset, NO);
+        assert_eq!(no.side, Side::Sell);
+        assert_eq!(no.price, 999_000);
     }
 
     #[test]
     fn frame_may_hold_one_event_or_a_batch() {
-        let one = book_frame(YES);
         let batch = format!("[{}, {}]", book_frame(YES), book_frame(NO));
 
-        assert_eq!(parse(&one).len(), 1);
-        assert_eq!(parse(&batch).len(), 2);
+        assert_eq!(decode(&book_frame(YES)).len(), 1);
+        assert_eq!(decode(&batch).len(), 2);
     }
 
     #[test]
@@ -197,18 +274,25 @@ mod tests {
             book_frame(NO)
         );
 
-        let parsed = parse(&batch);
+        let decoded = decode(&batch);
 
-        assert_eq!(parsed.len(), 3);
-        assert!(parsed[0].is_ok());
-        assert!(parsed[1].is_err());
-        assert!(parsed[2].is_ok());
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded[0].is_ok());
+        assert!(decoded[1].is_err());
+        assert!(decoded[2].is_ok());
     }
 
     #[test]
-    fn unknown_event_types_are_ignored() {
+    fn unknown_event_types_decode_to_nothing() {
         let frame = r#"{"event_type": "tick_size_change", "asset_id": "1", "old_tick_size": "0.01", "new_tick_size": "0.001"}"#;
 
-        assert!(matches!(serde_json::from_str(frame).unwrap(), Event::Other));
+        assert!(decode(frame).is_empty());
+    }
+
+    #[test]
+    fn unreadable_numbers_are_errors() {
+        let frame = book_frame(YES).replace("0.997", "abc");
+
+        assert!(decode(&frame)[0].is_err());
     }
 }

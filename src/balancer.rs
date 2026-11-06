@@ -1,4 +1,4 @@
-//! Assigns assets to websockets, filling spare capacity before opening new ones.
+//! Assigns assets to socket groups, filling spare capacity before opening new ones.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -6,7 +6,7 @@ use std::{
 };
 
 pub struct Balancer {
-    per_socket: NonZeroUsize,
+    per_group: NonZeroUsize,
     assigned: HashMap<String, usize>,
     loads: Vec<usize>,
     spare: BTreeSet<usize>,
@@ -15,18 +15,18 @@ pub struct Balancer {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placement {
-    Existing { socket: usize, asset: String },
+    Existing { group: usize, asset: String },
     New(Vec<String>),
 }
 
 impl Balancer {
-    pub fn new(per_socket: NonZeroUsize) -> Self {
+    pub fn new(per_group: NonZeroUsize) -> Self {
         Self {
-            per_socket,
+            per_group,
             assigned: HashMap::new(),
             loads: Vec::new(),
             spare: BTreeSet::new(),
-            pending: Vec::with_capacity(per_socket.get()),
+            pending: Vec::with_capacity(per_group.get()),
         }
     }
 
@@ -34,16 +34,16 @@ impl Balancer {
         if self.assigned.contains_key(&asset) || self.pending.contains(&asset) {
             return None;
         }
-        if let Some(&socket) = self.spare.first() {
-            self.assigned.insert(asset.clone(), socket);
-            self.loads[socket] += 1;
-            if self.loads[socket] == self.per_socket.get() {
-                self.spare.remove(&socket);
+        if let Some(&group) = self.spare.first() {
+            self.assigned.insert(asset.clone(), group);
+            self.loads[group] += 1;
+            if self.loads[group] == self.per_group.get() {
+                self.spare.remove(&group);
             }
-            return Some(Placement::Existing { socket, asset });
+            return Some(Placement::Existing { group, asset });
         }
         self.pending.push(asset);
-        if self.pending.len() < self.per_socket.get() {
+        if self.pending.len() < self.per_group.get() {
             return None;
         }
         self.flush()
@@ -53,24 +53,23 @@ impl Balancer {
         if self.pending.is_empty() {
             return None;
         }
-        let socket = self.loads.len();
-        let assets =
-            std::mem::replace(&mut self.pending, Vec::with_capacity(self.per_socket.get()));
+        let group = self.loads.len();
+        let assets = std::mem::replace(&mut self.pending, Vec::with_capacity(self.per_group.get()));
         for asset in &assets {
-            self.assigned.insert(asset.clone(), socket);
+            self.assigned.insert(asset.clone(), group);
         }
         self.loads.push(assets.len());
-        if assets.len() < self.per_socket.get() {
-            self.spare.insert(socket);
+        if assets.len() < self.per_group.get() {
+            self.spare.insert(group);
         }
         Some(Placement::New(assets))
     }
 
     pub fn remove(&mut self, asset: &str) -> Option<usize> {
-        let socket = self.assigned.remove(asset)?;
-        self.loads[socket] -= 1;
-        self.spare.insert(socket);
-        Some(socket)
+        let group = self.assigned.remove(asset)?;
+        self.loads[group] -= 1;
+        self.spare.insert(group);
+        Some(group)
     }
 
     pub fn gone(&self, current: &HashSet<String>) -> Vec<String> {
@@ -90,8 +89,8 @@ impl Balancer {
 mod tests {
     use super::*;
 
-    fn balancer(per_socket: usize) -> Balancer {
-        Balancer::new(NonZeroUsize::new(per_socket).unwrap())
+    fn balancer(per_group: usize) -> Balancer {
+        Balancer::new(NonZeroUsize::new(per_group).unwrap())
     }
 
     fn owned(assets: &[&str]) -> Vec<String> {
@@ -99,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_a_new_socket_every_per_socket_assets() {
+    fn opens_a_new_group_every_per_group_assets() {
         let mut balancer = balancer(2);
 
         assert_eq!(balancer.add("a".to_owned()), None);
@@ -125,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn fills_spare_capacity_before_opening_sockets() {
+    fn fills_spare_capacity_before_opening_groups() {
         let mut balancer = balancer(2);
         balancer.add("a".to_owned());
         balancer.add("b".to_owned());
@@ -135,7 +134,7 @@ mod tests {
         assert_eq!(
             balancer.add("d".to_owned()),
             Some(Placement::Existing {
-                socket: 1,
+                group: 1,
                 asset: "d".to_owned()
             })
         );
@@ -144,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_assets_free_their_socket() {
+    fn removed_assets_free_their_group() {
         let mut balancer = balancer(2);
         balancer.add("a".to_owned());
         balancer.add("b".to_owned());
@@ -154,7 +153,7 @@ mod tests {
         assert_eq!(
             balancer.add("c".to_owned()),
             Some(Placement::Existing {
-                socket: 0,
+                group: 0,
                 asset: "c".to_owned()
             })
         );

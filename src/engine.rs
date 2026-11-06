@@ -8,11 +8,11 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    book::{self, LevelUpdate, OrderBook},
-    polymarket::ws::{Book, Event, PriceChange},
+    book::OrderBook,
+    event::{Event, Snapshot, Update},
     util::{
         AlignedSbeWriter,
         dtos::challenge_orderbook::{
@@ -24,13 +24,19 @@ use crate::{
 
 // The template reader can only read 64 MiB chunks.
 pub const CHUNK_SIZE: usize = 64 << 20;
+// A source socket that sent no frame for this long, not even a heartbeat reply, is
+// replaced by a redundant one that did. Shorter than the socket's own 30 s stall
+// detection, so the output keeps flowing while the stalled socket reconnects.
+const SWITCH_AFTER: Duration = Duration::from_secs(15);
 
 pub enum Inbound {
     Assign {
         asset: String,
-        socket: usize,
+        sockets: Vec<usize>,
     },
     Forget(String),
+    Alive(usize),
+    Down(usize),
     Event {
         socket: usize,
         received_at: DateTime<Utc>,
@@ -38,25 +44,48 @@ pub enum Inbound {
     },
 }
 
-struct Subscription {
+struct Feed {
     socket: usize,
     book: Option<OrderBook>,
 }
 
+// Every socket of the group keeps its own book; only the source's changes are written.
+struct Subscription {
+    source: usize,
+    feeds: Vec<Feed>,
+}
+
+impl Subscription {
+    fn book(&self) -> Option<&OrderBook> {
+        self.feeds
+            .iter()
+            .find(|feed| feed.socket == self.source)
+            .and_then(|feed| feed.book.as_ref())
+    }
+}
+
+fn feed(feeds: &mut [Feed], socket: usize) -> Option<&mut Feed> {
+    feeds.iter_mut().find(|feed| feed.socket == socket)
+}
+
 pub struct Engine {
     subscriptions: HashMap<String, Subscription>,
+    last_event: HashMap<usize, Instant>,
     writer: AlignedSbeWriter,
     snapshot_interval: Duration,
     max_lag: TimeDelta,
+    switches: usize,
 }
 
 impl Engine {
     pub fn new(writer: AlignedSbeWriter, snapshot_interval: Duration) -> Self {
         Self {
             subscriptions: HashMap::new(),
+            last_event: HashMap::new(),
             writer,
             snapshot_interval,
             max_lag: TimeDelta::zero(),
+            switches: 0,
         }
     }
 
@@ -86,13 +115,34 @@ impl Engine {
 
     fn handle(&mut self, inbound: Inbound) -> anyhow::Result<()> {
         match inbound {
-            Inbound::Assign { asset, socket } => {
-                self.subscriptions
-                    .insert(asset, Subscription { socket, book: None });
+            Inbound::Assign { asset, sockets } => {
+                // The quiet clock of a new socket starts now, not at its first event.
+                for &socket in &sockets {
+                    self.last_event.entry(socket).or_insert_with(Instant::now);
+                }
+                let feeds = sockets
+                    .iter()
+                    .map(|&socket| Feed { socket, book: None })
+                    .collect();
+                self.subscriptions.insert(
+                    asset,
+                    Subscription {
+                        source: sockets[0],
+                        feeds,
+                    },
+                );
                 Ok(())
             }
             Inbound::Forget(asset) => {
                 self.subscriptions.remove(&asset);
+                Ok(())
+            }
+            Inbound::Alive(socket) => {
+                self.last_event.insert(socket, Instant::now());
+                Ok(())
+            }
+            Inbound::Down(socket) => {
+                self.last_event.remove(&socket);
                 Ok(())
             }
             Inbound::Event {
@@ -101,79 +151,77 @@ impl Engine {
                 event,
             } => {
                 self.max_lag = self.max_lag.max(Utc::now() - received_at);
+                self.last_event.insert(socket, Instant::now());
                 match event {
-                    Event::Book(book) => self.book(socket, &book, received_at),
-                    Event::PriceChange(change) => self.price_change(socket, &change, received_at),
-                    Event::Other => Ok(()),
+                    Event::Snapshot(snapshot) => self.snapshot(socket, &snapshot, received_at),
+                    Event::Update(update) => self.update(socket, &update, received_at),
                 }
             }
         }
     }
 
-    fn book(
+    fn snapshot(
         &mut self,
         socket: usize,
-        book: &Book,
+        snapshot: &Snapshot,
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let Some(subscription) = owned(&mut self.subscriptions, &book.asset_id, socket) else {
+        let Some(subscription) = self.subscriptions.get_mut(&snapshot.asset) else {
             return Ok(());
         };
-        match OrderBook::try_from(book) {
-            Ok(order_book) => {
-                self.writer
-                    .write_msg(&snapshot(&book.asset_id, &order_book, received_at))?;
-                subscription.book = Some(order_book);
+        let Some(feed) = feed(&mut subscription.feeds, socket) else {
+            return Ok(());
+        };
+        let order_book = feed.book.insert(OrderBook::from(snapshot));
+        if subscription.source != socket {
+            if !stale(&self.last_event, subscription.source) {
+                return Ok(());
             }
-            Err(error) => {
-                warn!(%error, asset = %book.asset_id, "dropped a book that could not be read");
-                subscription.book = None;
-            }
+            debug!(asset = %snapshot.asset, from = subscription.source, to = socket, "switched source");
+            self.switches += 1;
+            subscription.source = socket;
         }
+        self.writer
+            .write_msg(&encode_snapshot(&snapshot.asset, order_book, received_at))?;
         Ok(())
     }
 
-    fn price_change(
+    fn update(
         &mut self,
         socket: usize,
-        change: &PriceChange,
+        update: &Update,
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let exchange_ts = match book::parse_timestamp(&change.timestamp) {
-            Ok(exchange_ts) => exchange_ts,
-            Err(error) => {
-                warn!(%error, "ignored a price change with an unreadable timestamp");
-                return Ok(());
-            }
+        let Some(subscription) = self.subscriptions.get_mut(&update.asset) else {
+            return Ok(());
         };
-        for level in &change.price_changes {
-            let Some(subscription) = owned(&mut self.subscriptions, &level.asset_id, socket) else {
-                continue;
-            };
-            // Polymarket sends a book for every subscribed asset, so a change before the book
-            // is unexpected. Starting from an empty snapshot keeps every stream snapshot-first.
-            if subscription.book.is_none() {
-                warn!(asset = %level.asset_id, "price change before book");
-                let empty = OrderBook::empty(exchange_ts);
+        let Some(feed) = feed(&mut subscription.feeds, socket) else {
+            return Ok(());
+        };
+        if subscription.source == socket {
+            // The exchange sends a book for every subscribed asset, so an update before it
+            // is unexpected. Starting from an empty book keeps the stream snapshot-first.
+            if feed.book.is_none() {
+                warn!(asset = %update.asset, "update before snapshot");
+                let empty = OrderBook::empty(update.exchange_ts);
                 self.writer
-                    .write_msg(&snapshot(&level.asset_id, &empty, received_at))?;
-                subscription.book = Some(empty);
+                    .write_msg(&encode_snapshot(&update.asset, &empty, received_at))?;
+                feed.book = Some(empty);
             }
-            let Some(order_book) = &mut subscription.book else {
-                continue;
-            };
-            match order_book.apply(level, exchange_ts) {
-                Ok(update) => self.writer.write_msg(&level_update(
-                    &level.asset_id,
-                    update,
-                    received_at,
-                    exchange_ts,
-                ))?,
-                Err(error) => {
-                    warn!(%error, asset = %level.asset_id, "dropped a book after an unreadable level");
-                    subscription.book = None;
-                }
-            }
+        }
+        // A redundant socket only counts once it has a real book to switch to.
+        let Some(order_book) = &mut feed.book else {
+            return Ok(());
+        };
+        order_book.apply(update);
+        if subscription.source == socket {
+            self.writer.write_msg(&encode_update(update, received_at))?;
+        } else if stale(&self.last_event, subscription.source) {
+            debug!(asset = %update.asset, from = subscription.source, to = socket, "switched source");
+            self.switches += 1;
+            subscription.source = socket;
+            self.writer
+                .write_msg(&encode_snapshot(&update.asset, order_book, received_at))?;
         }
         Ok(())
     }
@@ -184,35 +232,31 @@ impl Engine {
         let received_at = Utc::now();
         let mut books = 0;
         for (symbol, subscription) in &self.subscriptions {
-            if let Some(book) = &subscription.book {
+            if let Some(book) = subscription.book() {
                 self.writer
-                    .write_msg(&snapshot(symbol, book, received_at))?;
+                    .write_msg(&encode_snapshot(symbol, book, received_at))?;
                 books += 1;
             }
         }
         info!(
             books,
             max_lag_ms = self.max_lag.num_milliseconds(),
+            switches = self.switches,
             "snapshot round"
         );
         self.max_lag = TimeDelta::zero();
+        self.switches = 0;
         Ok(())
     }
 }
 
-// Only the socket an asset is assigned to may touch its book. Anything else is a late
-// message from a socket that no longer owns the asset.
-fn owned<'a>(
-    subscriptions: &'a mut HashMap<String, Subscription>,
-    asset: &str,
-    socket: usize,
-) -> Option<&'a mut Subscription> {
-    subscriptions
-        .get_mut(asset)
-        .filter(|subscription| subscription.socket == socket)
+fn stale(last_event: &HashMap<usize, Instant>, socket: usize) -> bool {
+    last_event
+        .get(&socket)
+        .is_none_or(|at| at.elapsed() > SWITCH_AFTER)
 }
 
-fn snapshot(symbol: &str, book: &OrderBook, received_at: DateTime<Utc>) -> SnapshotDomain {
+fn encode_snapshot(symbol: &str, book: &OrderBook, received_at: DateTime<Utc>) -> SnapshotDomain {
     SnapshotDomain {
         received_at,
         exchange_timestamp: book.exchange_ts,
@@ -236,19 +280,14 @@ fn snapshot(symbol: &str, book: &OrderBook, received_at: DateTime<Utc>) -> Snaps
     }
 }
 
-fn level_update(
-    symbol: &str,
-    update: LevelUpdate,
-    received_at: DateTime<Utc>,
-    exchange_ts: DateTime<Utc>,
-) -> PriceLevelUpdateDomain {
+fn encode_update(update: &Update, received_at: DateTime<Utc>) -> PriceLevelUpdateDomain {
     PriceLevelUpdateDomain {
         backtest_timestamp: received_at,
-        exchange_timestamp: exchange_ts,
+        exchange_timestamp: update.exchange_ts,
         price_level: update.price,
         quantity: update.quantity,
         side: update.side,
-        symbol: symbol.to_owned(),
+        symbol: update.asset.clone(),
     }
 }
 
@@ -257,7 +296,7 @@ mod tests {
     use super::*;
     use crate::{
         Side,
-        polymarket::ws::{Book, Level, LevelChange, OrderSide, PriceChange},
+        event::Level,
         util::{AlignedSbeReader, OrderbookSchema, dtos::challenge_orderbook::AnyMessage},
     };
 
@@ -269,19 +308,12 @@ mod tests {
         Update(PriceLevelUpdateDomain),
     }
 
-    async fn write_and_read_back(inbound: Vec<Inbound>) -> Vec<Written> {
-        let file = tempfile::NamedTempFile::new().unwrap();
+    fn engine(file: &tempfile::NamedTempFile) -> Engine {
         let writer = AlignedSbeWriter::create(file.path(), CHUNK_SIZE).unwrap();
-        let (tx, rx) = mpsc::unbounded_channel();
-        for message in inbound {
-            tx.send(message).unwrap();
-        }
-        drop(tx);
         Engine::new(writer, Duration::from_secs(3600))
-            .run(rx, CancellationToken::new())
-            .await
-            .unwrap();
+    }
 
+    fn read_back(file: &tempfile::NamedTempFile) -> Vec<Written> {
         let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path()).unwrap();
         let mut written = Vec::new();
         while let Some(message) = reader.read_msg().unwrap() {
@@ -298,56 +330,68 @@ mod tests {
         written
     }
 
+    async fn write_and_read_back(inbound: Vec<Inbound>) -> Vec<Written> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        for message in inbound {
+            tx.send(message).unwrap();
+        }
+        drop(tx);
+        engine(&file)
+            .run(rx, CancellationToken::new())
+            .await
+            .unwrap();
+        read_back(&file)
+    }
+
     fn received_at() -> DateTime<Utc> {
         DateTime::from_timestamp_millis(1_793_977_813_040).unwrap()
     }
 
-    fn assign(socket: usize) -> Inbound {
+    fn assign(sockets: &[usize]) -> Inbound {
         Inbound::Assign {
             asset: ASSET.to_owned(),
-            socket,
+            sockets: sockets.to_vec(),
         }
     }
 
-    fn level(price: &str, size: &str) -> Level {
-        Level {
-            price: price.to_owned(),
-            size: size.to_owned(),
-        }
+    fn level(price: i64, quantity: i64) -> Level {
+        Level { price, quantity }
     }
 
     fn book(socket: usize) -> Inbound {
         Inbound::Event {
             socket,
             received_at: received_at(),
-            event: Event::Book(Book {
-                asset_id: ASSET.to_owned(),
-                timestamp: "1793977813000".to_owned(),
-                bids: vec![level("0.997", "105486.43"), level("0.998", "287197.36")],
-                asks: vec![level("0.999", "1369896.93")],
+            event: Event::Snapshot(Snapshot {
+                asset: ASSET.to_owned(),
+                exchange_ts: DateTime::from_timestamp_millis(1_793_977_813_000).unwrap(),
+                bids: vec![
+                    level(997_000, 105_486_430_000),
+                    level(998_000, 287_197_360_000),
+                ],
+                asks: vec![level(999_000, 1_369_896_930_000)],
             }),
         }
     }
 
-    fn price_change(socket: usize, price: &str, size: &str, side: OrderSide) -> Inbound {
+    fn price_change(socket: usize, price: i64, quantity: i64, side: Side) -> Inbound {
         Inbound::Event {
             socket,
             received_at: received_at(),
-            event: Event::PriceChange(PriceChange {
-                timestamp: "1793977816442".to_owned(),
-                price_changes: vec![LevelChange {
-                    asset_id: ASSET.to_owned(),
-                    price: price.to_owned(),
-                    size: size.to_owned(),
-                    side,
-                }],
+            event: Event::Update(Update {
+                asset: ASSET.to_owned(),
+                exchange_ts: DateTime::from_timestamp_millis(1_793_977_816_442).unwrap(),
+                side,
+                price,
+                quantity,
             }),
         }
     }
 
     #[tokio::test]
     async fn book_is_written_as_a_snapshot() {
-        let written = write_and_read_back(vec![assign(0), book(0)]).await;
+        let written = write_and_read_back(vec![assign(&[0]), book(0)]).await;
 
         let [Written::Snapshot(snapshot)] = written.as_slice() else {
             panic!("expected exactly one snapshot");
@@ -367,9 +411,9 @@ mod tests {
     #[tokio::test]
     async fn price_change_is_written_as_a_level_update() {
         let written = write_and_read_back(vec![
-            assign(0),
+            assign(&[0]),
             book(0),
-            price_change(0, "0.998", "1100", OrderSide::Buy),
+            price_change(0, 998_000, 1_100_000_000, Side::Buy),
         ])
         .await;
 
@@ -390,8 +434,8 @@ mod tests {
     #[tokio::test]
     async fn change_before_book_starts_from_an_empty_snapshot() {
         let written = write_and_read_back(vec![
-            assign(0),
-            price_change(0, "0.42", "25", OrderSide::Sell),
+            assign(&[0]),
+            price_change(0, 420_000, 25_000_000, Side::Sell),
         ])
         .await;
 
@@ -405,11 +449,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_from_a_socket_that_does_not_own_the_asset_are_ignored() {
+    async fn messages_from_a_socket_outside_the_group_are_ignored() {
         let written = write_and_read_back(vec![
-            assign(0),
+            assign(&[0]),
             book(1),
-            price_change(1, "0.998", "1100", OrderSide::Buy),
+            price_change(1, 998_000, 1_100_000_000, Side::Buy),
         ])
         .await;
 
@@ -419,13 +463,113 @@ mod tests {
     #[tokio::test]
     async fn forgotten_asset_is_not_written_again() {
         let written = write_and_read_back(vec![
-            assign(0),
+            assign(&[0]),
             book(0),
             Inbound::Forget(ASSET.to_owned()),
-            price_change(0, "0.998", "1100", OrderSide::Buy),
+            price_change(0, 998_000, 1_100_000_000, Side::Buy),
         ])
         .await;
 
         assert!(matches!(written.as_slice(), [Written::Snapshot(_)]));
+    }
+
+    #[tokio::test]
+    async fn redundant_socket_stays_silent_while_the_source_delivers() {
+        let written = write_and_read_back(vec![
+            assign(&[0, 1]),
+            book(0),
+            book(1),
+            price_change(1, 998_000, 1_100_000_000, Side::Buy),
+        ])
+        .await;
+
+        assert!(matches!(written.as_slice(), [Written::Snapshot(_)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_replies_keep_a_quiet_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(engine(&file).run(rx, CancellationToken::new()));
+
+        tx.send(assign(&[0, 1])).unwrap();
+        tx.send(book(0)).unwrap();
+        tx.send(book(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tx.send(Inbound::Alive(0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tx.send(price_change(1, 998_000, 1_100_000_000, Side::Buy))
+            .unwrap();
+        drop(tx);
+        run.await.unwrap().unwrap();
+
+        assert!(matches!(
+            read_back(&file).as_slice(),
+            [Written::Snapshot(_)]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redundant_socket_without_a_book_never_becomes_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(engine(&file).run(rx, CancellationToken::new()));
+
+        tx.send(assign(&[0, 1])).unwrap();
+        tx.send(book(0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(SWITCH_AFTER + Duration::from_secs(1)).await;
+        tx.send(price_change(1, 998_000, 1_100_000_000, Side::Buy))
+            .unwrap();
+        drop(tx);
+        run.await.unwrap().unwrap();
+
+        assert!(matches!(
+            read_back(&file).as_slice(),
+            [Written::Snapshot(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_switches_at_once_when_its_socket_goes_down() {
+        let written = write_and_read_back(vec![
+            assign(&[0, 1]),
+            book(0),
+            book(1),
+            Inbound::Down(0),
+            price_change(1, 998_000, 1_100_000_000, Side::Buy),
+        ])
+        .await;
+
+        let [Written::Snapshot(_), Written::Snapshot(switched)] = written.as_slice() else {
+            panic!("expected the original snapshot and one from the new source");
+        };
+        assert_eq!(switched.bids[1].quantity, 1_100_000_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_switches_to_the_socket_that_keeps_delivering() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(engine(&file).run(rx, CancellationToken::new()));
+
+        tx.send(assign(&[0, 1])).unwrap();
+        tx.send(book(0)).unwrap();
+        tx.send(book(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(SWITCH_AFTER + Duration::from_secs(1)).await;
+        tx.send(price_change(1, 998_000, 1_100_000_000, Side::Buy))
+            .unwrap();
+        drop(tx);
+        run.await.unwrap().unwrap();
+
+        let written = read_back(&file);
+        let [Written::Snapshot(_), Written::Snapshot(switched)] = written.as_slice() else {
+            panic!("expected the original snapshot and one from the new source");
+        };
+        assert_eq!(switched.bids[1].price_level, 998_000);
+        assert_eq!(switched.bids[1].quantity, 1_100_000_000);
     }
 }

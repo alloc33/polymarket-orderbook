@@ -8,6 +8,7 @@ use clap::Parser;
 use polymarket_orderbook::{
     collector::Collector,
     engine::{self, Engine},
+    polymarket::Polymarket,
     util::AlignedSbeWriter,
 };
 use tokio::sync::mpsc;
@@ -29,6 +30,9 @@ struct Config {
     /// Assets per websocket; 100 is the most that still gets every initial book promptly
     #[arg(long, default_value = "100")]
     assets_per_socket: NonZeroUsize,
+    /// Redundant websockets per asset group; the output switches source if one goes quiet
+    #[arg(long, default_value = "2")]
+    sockets_per_group: NonZeroUsize,
     /// Subscribe only the first N listed assets (for testing)
     #[arg(long)]
     limit: Option<usize>,
@@ -59,8 +63,9 @@ async fn main() -> anyhow::Result<()> {
             }
         })?;
 
-    let mut collector = Collector::new(
+    let mut collector = Collector::<Polymarket>::new(
         config.assets_per_socket,
+        config.sockets_per_group,
         config.limit,
         events,
         shutdown.clone(),

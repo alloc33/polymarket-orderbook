@@ -24,11 +24,12 @@ Logs go to stderr, data goes to stdout. Ctrl-C closes every websocket and the fi
 --snapshot-interval <SECS>   full snapshot of every book (default 60)
 --discovery-interval <SECS>  re-list live assets, subscribe new, drop closed (default 300)
 --assets-per-socket <N>      assets per websocket (default 100)
+--sockets-per-group <N>      redundant websockets per group of assets (default 2)
 --limit <N>                  only the first N assets, for trying things out
 ```
 
-The full universe is about 470,000 assets on about 4,700 websockets, so the open
-file limit has to allow that (`ulimit -n 65536`). Listing the assets takes three to
+The full universe is about 470,000 assets in about 4,700 groups, each on two
+websockets, so the open file limit has to allow that (`ulimit -n 65536`). Listing the assets takes three to
 eight minutes depending on how Polymarket's API feels that day; sockets start as soon
 as the first page arrives.
 
@@ -44,25 +45,36 @@ the template's reader works (it reads fixed chunks), not something to fix here.
 ## How it works
 
 ```
-Gamma REST ──► collector ──► balancer ──► connection tasks (one per websocket)
+Gamma REST ──► collector ──► balancer ──► connection tasks (two per asset group)
                   │                                │ events + receive time + socket id
-                  │ who owns which asset           ▼
+                  │ which sockets carry an asset   ▼
                   └──────────────────────────► engine ──► AlignedSbeWriter ──► stdout
 ```
 
+Only the `polymarket` module knows the exchange. It implements the `Exchange` trait
+(`exchange.rs`): list the live assets, connect, build subscribe and unsubscribe
+messages, heartbeat, and decode frames into `event::Snapshot` / `event::Update` in
+fixed point. The connection and the collector are generic over that trait, and
+everything from the event onwards never sees an exchange type. A second exchange is a
+second implementation of the trait. The trait has no state because Polymarket needs
+none; an exchange that signs its handshake or tracks server-side subscription ids, as
+Kalshi does, would take `&self` and keep them there.
+
 - `polymarket/rest.rs` lists live assets page by page. An asset is one outcome token;
   every market has two. Inactive placeholder markets are skipped.
-- `polymarket/ws.rs` is the wire format of the websocket: subscribe commands and the
-  `book` / `price_change` messages.
-- `balancer.rs` decides which socket an asset goes to: a socket with spare room,
+- `polymarket/ws.rs` connects, builds commands, and decodes the exchange's `book` and
+  `price_change` messages into events.
+- `fixed.rs` turns decimal strings into the schema's fixed-point integers.
+- `balancer.rs` decides which group an asset goes to: a group with spare room,
   otherwise a new one every 100 assets.
-- `connection.rs` runs one websocket: subscribe, PING every 10 s, stamp each frame with
-  the time it arrived, forward it. If the connect, a write or the feed stalls for 30 s
-  it reconnects with backoff and resubscribes.
-- `engine.rs` owns the books and the writer, on its own thread. A `book` message
-  becomes a snapshot, each `price_change` line a price level update, and every minute
-  it writes a snapshot of every book. It only accepts messages from the socket an
-  asset is assigned to.
+- `connection.rs` runs one websocket: subscribe, heartbeat every 10 s, stamp each
+  frame with the time it arrived, decode, forward. If the connect, a write or the feed
+  stalls for 30 s it reconnects with backoff and resubscribes, and tells the engine it
+  went down.
+- `engine.rs` owns the books and the writer, on its own thread. Every socket of a group
+  keeps its own copy of each book; only the current source's changes are written. A
+  snapshot event becomes a snapshot, an update a price level update, and every minute
+  it writes a snapshot of every book.
 - `collector.rs` ties it together and, every five minutes, re-lists the assets to
   subscribe new ones and unsubscribe the ones that stopped trading.
 
@@ -83,8 +95,18 @@ every stream begins with a snapshot.
 
 A `price_change` is per market and carries both tokens' lines, and after a reconnect a
 socket can still deliver messages for an asset that has moved elsewhere. So the
-collector tells the engine which socket owns each asset, and the engine ignores the
+collector tells the engine which sockets carry each asset, and the engine ignores the
 rest. One rule covers duplicates and late messages.
+
+Every group of assets runs on two websockets. Both keep books; one is the source. A
+socket counts as alive while frames arrive, heartbeat replies included, so a quiet
+market never looks like a dead socket. If the source misses its heartbeats for 15 s,
+or reports that it went down, the next event from the other socket makes it the
+source, provided it holds a real book, and the engine writes a snapshot from that
+book before continuing with its updates, because the two books can differ by whatever
+the stalled socket missed. 15 s is half the socket's own stall detection, so the
+output keeps flowing while the stalled socket reconnects. The cost is twice the
+sockets and twice the books in memory.
 
 The engine is one thread with no locks, so output order is total and the minute
 snapshot is a consistent cut. Replay the file in file order; sorting by receive time
@@ -96,10 +118,16 @@ size it stays under half a second.
 On Ctrl-C the sockets get 15 s to close politely (5 s each for the handshake), anything
 still wedged is aborted, then the engine flushes the last chunk and exits.
 
-Numbers from a 22 minute full run on 2026-11-06: 473,254 assets on 4,734 sockets;
-one discovery round added 130 and removed 96; about 540 reconnects, nearly all 30 s
-silences; 9.4 M snapshots and 37 M level updates written and read back; 1.2 GB of
-memory. Logs are not in the repo and the numbers vary with Polymarket's load.
+Numbers from a 17 minute full run on 2026-11-07 with two sockets per group: 475,266
+assets on 9,506 sockets; 3.1 M snapshots and 12.8 M level updates written and read
+back; worst receive-to-write lag per minute under 600 ms; 1.9 GB of memory. Doubling
+the sockets has a visible price at this size: Polymarket throttles that many connects
+from one address, so startup takes about ten minutes of stalled and retried connects,
+and the engine switches source tens of thousands of times while sockets come and go.
+Once settled it switches about a hundred times a minute. The output never stopped and
+the process exited cleanly, which is the point of the extension. With one socket per
+group the same run connects in four minutes and sees a handful of stalls. Logs are not
+in the repo; the numbers vary with Polymarket's load.
 
 ## Not done
 
@@ -113,8 +141,8 @@ memory. Logs are not in the repo and the numbers vary with Polymarket's load.
   look at it.
 - One output file, no rotation. A crash loses the chunk being buffered (up to 64 MiB);
   flushing more often is not free, because the format pads every flush to a full chunk.
-- The extensions from the task page: redundant sockets, per-asset activity monitoring,
-  a second exchange behind the same engine, latency experiments.
+- From the task page's extensions: per-asset activity monitoring with resubscription,
+  periodic full reconnects, and latency experiments.
 
 ## Tests
 
@@ -124,8 +152,9 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Tests cover the pure parts: number and timestamp parsing, book updates, wire message
-parsing including batches with a bad element, socket placement, the socket ownership
-rule, and a write-then-read-back of the engine through the template reader. Network
+decoding including batches with a bad element, group placement, the socket ownership
+rule, source switching on a paused clock, and a write-then-read-back of the engine
+through the template reader. Network
 behaviour was checked by running against the live feed at full size. `src/util`,
 `src/side.rs` and `sbe_schemas` are the template, unchanged; `src/util` is excluded
 from rustfmt so it stays that way.
