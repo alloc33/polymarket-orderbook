@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use tokio::{
@@ -89,9 +92,17 @@ impl Engine {
                     }
                 };
                 for level in &change.price_changes {
-                    let Some(order_book) = self.books.get_mut(&level.asset_id) else {
-                        warn!(asset = %level.asset_id, "price change before book");
-                        continue;
+                    let order_book = match self.books.entry(level.asset_id.clone()) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let order_book = entry.insert(OrderBook::empty(exchange_ts));
+                            self.writer.write_msg(&snapshot(
+                                &level.asset_id,
+                                order_book,
+                                inbound.received_at,
+                            ))?;
+                            order_book
+                        }
                     };
                     let update = match order_book.apply(level, exchange_ts) {
                         Ok(update) => update,
@@ -244,6 +255,55 @@ mod tests {
             update.exchange_timestamp.timestamp_millis(),
             1_793_811_751_973
         );
+
+        assert!(reader.read_msg().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn first_price_change_of_unknown_asset_opens_an_empty_book() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let writer = AlignedSbeWriter::create(file.path(), CHUNK_SIZE).unwrap();
+        let engine = Engine::new(writer, Duration::from_secs(3600));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let received_at = DateTime::from_timestamp_millis(1_793_811_751_990).unwrap();
+
+        tx.send(Inbound {
+            received_at,
+            event: Event::PriceChange(PriceChange {
+                timestamp: "1793811751973".to_owned(),
+                price_changes: vec![LevelChange {
+                    asset_id: "7".to_owned(),
+                    price: "0.42".to_owned(),
+                    size: "25".to_owned(),
+                    side: OrderSide::Sell,
+                }],
+            }),
+        })
+        .unwrap();
+        drop(tx);
+        engine.run(rx).await.unwrap();
+
+        let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path()).unwrap();
+
+        let Some(AnyMessage::Snapshot(decoded)) = reader.read_msg().unwrap() else {
+            panic!("expected an empty snapshot first");
+        };
+        let snapshot = SnapshotDomain::try_from_decoder(decoded).unwrap();
+        assert_eq!(snapshot.symbol, "7");
+        assert!(snapshot.bids.is_empty());
+        assert!(snapshot.asks.is_empty());
+        assert_eq!(
+            snapshot.exchange_timestamp.timestamp_millis(),
+            1_793_811_751_973
+        );
+
+        let Some(AnyMessage::PriceLevelUpdate(decoded)) = reader.read_msg().unwrap() else {
+            panic!("expected the level update second");
+        };
+        let update = PriceLevelUpdateDomain::try_from_decoder(decoded).unwrap();
+        assert_eq!(update.side, Side::Sell);
+        assert_eq!(update.price_level, 420_000);
+        assert_eq!(update.quantity, 25_000_000);
 
         assert!(reader.read_msg().unwrap().is_none());
     }

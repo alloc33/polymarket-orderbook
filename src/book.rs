@@ -26,6 +26,14 @@ pub struct LevelUpdate {
 }
 
 impl OrderBook {
+    pub fn empty(exchange_ts: DateTime<Utc>) -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            exchange_ts,
+        }
+    }
+
     pub fn apply(
         &mut self,
         change: &LevelChange,

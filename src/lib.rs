@@ -1,3 +1,4 @@
+pub mod balancer;
 pub mod book;
 pub mod connection;
 pub mod engine;

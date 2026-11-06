@@ -1,6 +1,5 @@
-use std::collections::BTreeSet;
-
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 const EVENTS_URL: &str = "https://gamma-api.polymarket.com/events/keyset";
@@ -41,20 +40,26 @@ impl Market {
     }
 }
 
-pub async fn live_assets(client: &reqwest::Client) -> anyhow::Result<BTreeSet<String>> {
-    let mut assets = BTreeSet::new();
+pub async fn live_assets(
+    client: &reqwest::Client,
+    assets: &mpsc::UnboundedSender<String>,
+) -> anyhow::Result<()> {
     let mut cursor = None;
 
     loop {
         let page = fetch_page(client, cursor.as_deref()).await?;
 
         for market in page.events.iter().flat_map(|event| &event.markets) {
-            assets.extend(market.assets()?);
+            for asset in market.assets()? {
+                if assets.send(asset).is_err() {
+                    return Ok(());
+                }
+            }
         }
 
         match page.next_cursor {
             Some(next) => cursor = Some(next),
-            None => return Ok(assets),
+            None => return Ok(()),
         }
     }
 }

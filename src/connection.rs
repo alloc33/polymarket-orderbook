@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::{
     engine::Inbound,
@@ -22,7 +22,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut socket = ws::connect().await?;
     socket.send(ws::subscribe(&assets)).await?;
-    info!(assets = assets.len(), "subscribed");
+    debug!(assets = assets.len(), "subscribed");
 
     let subscribed: HashSet<String> = assets.into_iter().collect();
     let mut ping = tokio::time::interval(ws::PING_INTERVAL);
@@ -46,21 +46,20 @@ pub async fn run(
 }
 
 async fn close(mut socket: Socket) -> anyhow::Result<()> {
-    socket.close(None).await?;
     let handshake = async {
+        socket.close(None).await?;
         while let Some(frame) = socket.next().await {
             if matches!(frame, Ok(Message::Close(_)) | Err(_)) {
                 break;
             }
         }
+        anyhow::Ok(())
     };
-    if tokio::time::timeout(CLOSE_TIMEOUT, handshake)
-        .await
-        .is_err()
-    {
-        warn!("close handshake timed out");
+    match tokio::time::timeout(CLOSE_TIMEOUT, handshake).await {
+        Ok(result) => result?,
+        Err(_) => warn!("close handshake timed out"),
     }
-    info!("socket closed");
+    debug!("socket closed");
     Ok(())
 }
 
