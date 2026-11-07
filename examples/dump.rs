@@ -1,4 +1,5 @@
-//! Reads an output file back with the template reader and prints a summary.
+//! Reads an output file back with the template reader and prints a summary, including
+//! how far behind the exchange's own timestamps the updates were received.
 
 #![warn(clippy::pedantic)]
 
@@ -18,6 +19,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut snapshots = 0usize;
     let mut updates = 0usize;
+    let mut lags_ms = Vec::new();
     while let Some(message) = reader.read_msg()? {
         match message {
             AnyMessage::Snapshot(decoded) => {
@@ -37,6 +39,9 @@ fn main() -> anyhow::Result<()> {
             AnyMessage::PriceLevelUpdate(decoded) => {
                 let update = PriceLevelUpdateDomain::try_from_decoder(decoded)?;
                 updates += 1;
+                lags_ms.push(
+                    (update.backtest_timestamp - update.exchange_timestamp).num_milliseconds(),
+                );
                 if updates <= 3 {
                     println!(
                         "update {} received_at={} exchange={} {} {} -> {}",
@@ -54,5 +59,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("{snapshots} snapshots, {updates} price level updates");
+    print_lag(&mut lags_ms);
     Ok(())
+}
+
+fn print_lag(lags_ms: &mut [i64]) {
+    let Some(&max) = lags_ms.iter().max() else {
+        return;
+    };
+    lags_ms.sort_unstable();
+    let percentile = |p: usize| lags_ms[(lags_ms.len() - 1) * p / 100];
+    println!(
+        "exchange to receive lag: p50 {} ms, p90 {} ms, p99 {} ms, max {max} ms",
+        percentile(50),
+        percentile(90),
+        percentile(99)
+    );
 }

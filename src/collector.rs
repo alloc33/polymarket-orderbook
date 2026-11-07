@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 use crate::{
     balancer::{Balancer, Placement},
     connection::{self, Command},
-    engine::Inbound,
+    engine::{Inbound, Repair},
     exchange::Exchange,
 };
 
@@ -27,6 +27,7 @@ pub struct Collector<E> {
     groups: Vec<Vec<usize>>,
     connections: JoinSet<anyhow::Result<()>>,
     engine: mpsc::UnboundedSender<Inbound>,
+    repairs: mpsc::UnboundedReceiver<Repair>,
     shutdown: CancellationToken,
 }
 
@@ -36,6 +37,7 @@ impl<E: Exchange> Collector<E> {
         sockets_per_group: NonZeroUsize,
         limit: Option<usize>,
         engine: mpsc::UnboundedSender<Inbound>,
+        repairs: mpsc::UnboundedReceiver<Repair>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -50,6 +52,7 @@ impl<E: Exchange> Collector<E> {
             groups: Vec::new(),
             connections: JoinSet::new(),
             engine,
+            repairs,
             shutdown,
         })
     }
@@ -66,6 +69,7 @@ impl<E: Exchange> Collector<E> {
                         error!(%error, "discovery round failed");
                     }
                 }
+                Some(repair) = self.repairs.recv() => self.repair(repair),
                 Some(result) = self.connections.join_next() => {
                     if let Err(error) = result? {
                         error!(%error, "connection failed");
@@ -172,6 +176,13 @@ impl<E: Exchange> Collector<E> {
                 }
                 self.groups.push(sockets);
             }
+        }
+    }
+
+    fn repair(&self, repair: Repair) {
+        let command = Command::Resubscribe(repair.asset);
+        if self.sockets[repair.socket].send(command).is_err() {
+            warn!(socket = repair.socket, "connection is gone, repair dropped");
         }
     }
 

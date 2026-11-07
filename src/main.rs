@@ -49,7 +49,12 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let writer = AlignedSbeWriter::create(&config.output, engine::CHUNK_SIZE)?;
     let (events, inbox) = mpsc::unbounded_channel();
-    let engine = Engine::new(writer, Duration::from_secs(config.snapshot_interval));
+    let (repairs, requested) = mpsc::unbounded_channel();
+    let engine = Engine::new(
+        writer,
+        repairs,
+        Duration::from_secs(config.snapshot_interval),
+    );
     // The engine blocks on 64 MiB writes; on its own thread that never delays a socket.
     let engine = std::thread::Builder::new()
         .name("engine".to_owned())
@@ -68,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         config.sockets_per_group,
         config.limit,
         events,
+        requested,
         shutdown.clone(),
     )?;
     let outcome = tokio::select! {

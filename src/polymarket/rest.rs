@@ -15,12 +15,12 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct EventsPage {
-    events: Vec<Event>,
+    events: Vec<GammaEvent>,
     next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct Event {
+struct GammaEvent {
     #[serde(default)]
     markets: Vec<Market>,
 }
@@ -126,30 +126,29 @@ mod tests {
 
     #[test]
     fn page_yields_assets_of_live_markets_only() {
-        let json = format!(
-            r#"{{
-                "events": [
-                    {{
-                        "id": "12345",
-                        "title": "Who will win?",
-                        "markets": [
-                            {{"id": "1", "active": true, "acceptingOrders": true, "enableOrderBook": true,
-                             "clobTokenIds": "[\"{YES}\", \"{NO}\"]"}},
-                            {{"id": "2", "active": false, "acceptingOrders": true, "enableOrderBook": true,
-                             "clobTokenIds": "[\"1\", \"2\"]"}},
-                            {{"id": "3", "active": true, "acceptingOrders": false, "enableOrderBook": true,
-                             "clobTokenIds": "[\"3\", \"4\"]"}},
-                            {{"id": "4", "active": true, "acceptingOrders": true, "enableOrderBook": true,
-                             "clobTokenIds": null}}
-                        ]
-                    }},
-                    {{ "id": "12346", "title": "Event without markets" }}
-                ],
-                "next_cursor": "ydSsD4qHilYotO3MIYTL75t4"
-            }}"#
-        );
+        let page = serde_json::json!({
+            "events": [
+                {
+                    "id": "12345",
+                    "title": "Who will win?",
+                    "markets": [
+                        {"id": "1", "active": true, "acceptingOrders": true,
+                         "enableOrderBook": true,
+                         "clobTokenIds": format!("[\"{YES}\", \"{NO}\"]")},
+                        {"id": "2", "active": false, "acceptingOrders": true,
+                         "enableOrderBook": true, "clobTokenIds": "[\"1\", \"2\"]"},
+                        {"id": "3", "active": true, "acceptingOrders": false,
+                         "enableOrderBook": true, "clobTokenIds": "[\"3\", \"4\"]"},
+                        {"id": "4", "active": true, "acceptingOrders": true,
+                         "enableOrderBook": true, "clobTokenIds": null}
+                    ]
+                },
+                {"id": "12346", "title": "Event without markets"}
+            ],
+            "next_cursor": "ydSsD4qHilYotO3MIYTL75t4"
+        });
 
-        let page: EventsPage = serde_json::from_str(&json).unwrap();
+        let page: EventsPage = serde_json::from_value(page).unwrap();
         let assets: Vec<String> = page
             .events
             .iter()

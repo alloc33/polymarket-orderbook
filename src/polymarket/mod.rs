@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     event::Event,
-    exchange::{Exchange, Operation, Socket},
+    exchange::{DecodeError, Exchange, Operation, Socket},
 };
 
 mod rest;
@@ -45,7 +45,7 @@ impl Exchange for Polymarket {
         matches!(message, Message::Text(text) if text.as_str() == ws::PONG)
     }
 
-    fn decode(frame: &str) -> Vec<anyhow::Result<Event>> {
+    fn decode(frame: &str) -> Vec<Result<Event, DecodeError>> {
         ws::decode(frame)
     }
 }

@@ -50,8 +50,8 @@ impl From<&Snapshot> for OrderBook {
     }
 }
 
-fn levels(levels: &[Level]) -> BTreeMap<i64, i64> {
-    levels
+fn levels(entries: &[Level]) -> BTreeMap<i64, i64> {
+    entries
         .iter()
         .map(|level| (level.price, level.quantity))
         .collect()

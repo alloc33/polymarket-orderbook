@@ -23,11 +23,16 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+// A full reconnect now and then clears whatever state the exchange accumulated for
+// the socket; spread over ten minutes so the group's sockets never do it together.
+const RECONNECT_EVERY: Duration = Duration::from_secs(60 * 60);
+const RECONNECT_SPREAD: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub enum Command {
     Subscribe(String),
     Unsubscribe(String),
+    Resubscribe(String),
 }
 
 pub async fn run<E: Exchange>(
@@ -47,7 +52,8 @@ pub async fn run<E: Exchange>(
             Ok(socket) => return close(socket).await,
             Err(error) => error,
         };
-        // Tells the engine right away so a redundant socket can take over.
+        // Tells the engine right away so a redundant socket can take over. A missing
+        // engine means the process is already shutting down.
         let _ = engine.send(Inbound::Down(id));
         delay = next_delay(delay, started.elapsed());
         warn!(socket = id, %error, ?delay, "reconnecting");
@@ -73,10 +79,13 @@ async fn session<E: Exchange>(
 
     let mut heartbeat = tokio::time::interval(E::HEARTBEAT_INTERVAL);
     let mut last_frame = Instant::now();
+    let scheduled = tokio::time::sleep(RECONNECT_EVERY + random(RECONNECT_SPREAD));
+    tokio::pin!(scheduled);
 
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(socket),
+            () = &mut scheduled => bail!("scheduled reconnect"),
             _ = heartbeat.tick() => send(&mut socket, E::heartbeat()).await?,
             () = tokio::time::sleep_until(last_frame + STALL_TIMEOUT) => {
                 bail!("no frames for {STALL_TIMEOUT:?}")
@@ -90,7 +99,7 @@ async fn session<E: Exchange>(
                 let Some(frame) = frame else { bail!("socket closed") };
                 let frame = frame?;
                 if E::is_heartbeat_reply(&frame) {
-                    let _ = engine.send(Inbound::Alive(id));
+                    forward(engine, Inbound::Alive(id))?;
                     continue;
                 }
                 match frame {
@@ -121,6 +130,10 @@ async fn apply<E: Exchange>(
             subscribed.remove(&asset);
             send(socket, frame).await
         }
+        Command::Resubscribe(asset) => {
+            send(socket, E::update(Operation::Unsubscribe, &asset)).await?;
+            send(socket, E::update(Operation::Subscribe, &asset)).await
+        }
     }
 }
 
@@ -135,7 +148,11 @@ fn next_delay(delay: Duration, session_lasted: Duration) -> Duration {
 // Spreads reconnects out so that an outage does not end with every socket
 // connecting in the same second.
 fn jitter() -> Duration {
-    Duration::from_millis(rand::random_range(0..1000))
+    random(Duration::from_secs(1))
+}
+
+fn random(up_to: Duration) -> Duration {
+    up_to.mul_f64(rand::random_range(0.0..1.0))
 }
 
 async fn send(socket: &mut Socket, message: Message) -> anyhow::Result<()> {
@@ -170,18 +187,32 @@ fn dispatch<E: Exchange>(
     received_at: DateTime<Utc>,
     engine: &mpsc::UnboundedSender<Inbound>,
 ) -> anyhow::Result<()> {
-    for event in E::decode(frame) {
-        let Ok(event) = event.inspect_err(|error| warn!(%error, "unreadable event")) else {
-            continue;
+    for decoded in E::decode(frame) {
+        let event = match decoded {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(%error, asset = ?error.asset, "unreadable event");
+                if let Some(asset) = error.asset {
+                    forward(engine, Inbound::Broken { asset, socket: id })?;
+                }
+                continue;
+            }
         };
-        let inbound = Inbound::Event {
-            socket: id,
-            received_at,
-            event,
-        };
-        if engine.send(inbound).is_err() {
-            bail!("engine stopped");
-        }
+        forward(
+            engine,
+            Inbound::Event {
+                socket: id,
+                received_at,
+                event,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn forward(engine: &mpsc::UnboundedSender<Inbound>, inbound: Inbound) -> anyhow::Result<()> {
+    if engine.send(inbound).is_err() {
+        bail!("engine stopped");
     }
     Ok(())
 }
@@ -192,22 +223,26 @@ mod tests {
     use crate::polymarket::Polymarket;
 
     #[test]
-    fn forwards_every_readable_event_tagged_with_the_socket() {
+    fn forwards_readable_events_and_reports_broken_ones() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let frame = r#"[
             {"event_type": "book", "asset_id": "1", "timestamp": "1", "bids": [], "asks": []},
-            {"event_type": "book", "asset_id": 2},
+            {"event_type": "book", "asset_id": "2", "timestamp": "x", "bids": [], "asks": []},
             {"event_type": "book", "asset_id": "3", "timestamp": "1", "bids": [], "asks": []}
         ]"#;
 
         dispatch::<Polymarket>(frame, 7, Utc::now(), &tx).unwrap();
 
-        for _ in 0..2 {
-            let Inbound::Event { socket, .. } = rx.try_recv().unwrap() else {
-                panic!("expected an event");
-            };
-            assert_eq!(socket, 7);
-        }
+        let Inbound::Event { socket: 7, .. } = rx.try_recv().unwrap() else {
+            panic!("expected the first book");
+        };
+        let Inbound::Broken { asset, socket: 7 } = rx.try_recv().unwrap() else {
+            panic!("expected a repair request for the bad book");
+        };
+        assert_eq!(asset, "2");
+        let Inbound::Event { socket: 7, .. } = rx.try_recv().unwrap() else {
+            panic!("expected the last book");
+        };
         assert!(rx.try_recv().is_err());
     }
 

@@ -10,6 +10,26 @@ use crate::event::Event;
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+// The asset is kept when the frame named it, so the socket can be asked to
+// resubscribe exactly that book.
+#[derive(Debug)]
+pub struct DecodeError {
+    pub asset: Option<String>,
+    pub cause: anyhow::Error,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Operation {
     Subscribe,
@@ -34,5 +54,5 @@ pub trait Exchange: Send + Sync + 'static {
 
     fn is_heartbeat_reply(message: &Message) -> bool;
 
-    fn decode(frame: &str) -> Vec<anyhow::Result<Event>>;
+    fn decode(frame: &str) -> Vec<Result<Event, DecodeError>>;
 }
